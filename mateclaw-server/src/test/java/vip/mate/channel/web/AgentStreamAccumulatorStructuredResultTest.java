@@ -9,6 +9,37 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class AgentStreamAccumulatorStructuredResultTest {
     @Test
+    void retainsCopilotTurnIdentityBeforeTheFirstRuntimeEvent() throws Exception {
+        var accumulator = new AgentStreamAccumulator(new ObjectMapper(), new AgentStreamAccumulator.Sink() {
+            public void broadcast(String id, String event, Object payload) { }
+            public void updatePhase(String id, String phase) { }
+        });
+
+        accumulator.associateCopilotTurn("execution-7", 7001L);
+
+        var metadata = new ObjectMapper().readTree(accumulator.toMetadataJson());
+        assertEquals("execution-7", metadata.path("runtimeExecutionId").asText());
+        assertEquals(7001L, metadata.path("assistantMessageId").asLong());
+        assertEquals("copilot", metadata.path("runtimeProviderId").asText());
+    }
+
+    @Test
+    void capturesExplicitCopilotFailureForPersistence() throws Exception {
+        var accumulator = new AgentStreamAccumulator(new ObjectMapper(), new AgentStreamAccumulator.Sink() {
+            public void broadcast(String id, String event, Object payload) { }
+            public void updatePhase(String id, String phase) { }
+        });
+
+        accumulator.accept(StreamDelta.event("error", Map.of(
+                "runtimeOutcome", "failed",
+                "message", "provider failed")), "conv");
+
+        var metadata = new ObjectMapper().readTree(accumulator.toMetadataJson());
+        assertEquals("failed", metadata.path("runtimeOutcome").asText());
+        assertEquals("provider failed", metadata.path("runtimeErrorMessage").asText());
+    }
+
+    @Test
     void persistsStructuredContentForExactCallAcrossDuplicateCompletions() throws Exception {
         var mapper = new ObjectMapper();
         var accumulator = new AgentStreamAccumulator(mapper, new AgentStreamAccumulator.Sink() {

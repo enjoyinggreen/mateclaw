@@ -36,6 +36,7 @@
               <div class="lb-card__id">
                 <div class="lb-card__name">{{ run.agentName || t('live.unknownAgent') }}</div>
                 <div class="lb-card__age">{{ formatAge(run.ageMs) }}</div>
+                <div v-if="run.runtimeProvider" class="lb-card__provider">{{ run.runtimeProvider }}</div>
               </div>
             </div>
 
@@ -340,6 +341,16 @@ function goalPct(goal?: Goal): number {
   font-size: 11px;
   color: var(--mc-text-tertiary);
   font-variant-numeric: tabular-nums;
+}
+.lb-card__provider {
+  width: fit-content;
+  margin-top: 3px;
+  padding: 1px 6px;
+  border: 1px solid var(--mc-border-light);
+  border-radius: 999px;
+  color: var(--mc-text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
 }
 .lb-card__gap {
   margin: 8px 0 0;

@@ -21,6 +21,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 
 class AgentRuntimeControllerTest {
 
@@ -28,6 +30,8 @@ class AgentRuntimeControllerTest {
     private AgentRuntimeAggregator aggregator;
     private ChatStreamTracker streamTracker;
     private SubagentRegistry subagentRegistry;
+    private AuditEventService auditEventService;
+    private ConversationService conversationService;
     private AgentRuntimeController controller;
 
     @BeforeEach
@@ -35,12 +39,14 @@ class AgentRuntimeControllerTest {
         aggregator = mock(AgentRuntimeAggregator.class);
         streamTracker = mock(ChatStreamTracker.class);
         subagentRegistry = mock(SubagentRegistry.class);
+        auditEventService = mock(AuditEventService.class);
+        conversationService = mock(ConversationService.class);
         controller = new AgentRuntimeController(
                 aggregator,
                 streamTracker,
                 subagentRegistry,
-                mock(AuditEventService.class),
-                mock(ConversationService.class),
+                auditEventService,
+                conversationService,
                 mock(I18nService.class),
                 mock(DshRuntimeService.class));
     }
@@ -86,6 +92,52 @@ class AgentRuntimeControllerTest {
 
         assertEquals(404, ex.getCode());
         verify(streamTracker, never()).forceRecycle("conv-b");
+    }
+
+    @Test
+    void friendlyStopAuditsAnAuthorizedRun() {
+        when(aggregator.runBelongsToWorkspace("conv-a", WORKSPACE_ID)).thenReturn(true);
+        when(streamTracker.requestStop("conv-a")).thenReturn(true);
+
+        assertEquals(true, controller.stopFriendly("conv-a", WORKSPACE_ID, admin())
+                .getData().get("stopped"));
+
+        verify(streamTracker).requestStop("conv-a");
+        verify(auditEventService).record(
+                eq("agent-runtime.stop"), eq("agent-runtime"),
+                eq("conv-a"), eq("conv-a"), anyString());
+    }
+
+    @Test
+    void recycleAuditsAndFinalizesAnAuthorizedRun() {
+        when(aggregator.runBelongsToWorkspace("conv-a", WORKSPACE_ID)).thenReturn(true);
+        when(streamTracker.forceRecycle("conv-a")).thenReturn(true);
+
+        assertEquals(true, controller.recycle("conv-a", WORKSPACE_ID, admin())
+                .getData().get("recycled"));
+
+        verify(streamTracker).forceRecycle("conv-a");
+        verify(conversationService).updateStreamStatus("conv-a", "idle");
+        verify(conversationService).saveStopMarkerIfDangling("conv-a", null, "stopped");
+        verify(auditEventService).record(
+                eq("agent-runtime.recycle"), eq("agent-runtime"),
+                eq("conv-a"), eq("conv-a"), anyString());
+    }
+
+    @Test
+    void stopRejectsNonAdminBeforeLookingUpOrMutatingARun() {
+        Authentication member = new UsernamePasswordAuthenticationToken(
+                "member", "n/a", List.of(new SimpleGrantedAuthority("ROLE_USER")));
+
+        MateClawException ex = assertThrows(MateClawException.class,
+                () -> controller.stopFriendly("conv-a", WORKSPACE_ID, member));
+
+        assertEquals(403, ex.getCode());
+        verify(aggregator, never()).runBelongsToWorkspace("conv-a", WORKSPACE_ID);
+        verify(streamTracker, never()).requestStop("conv-a");
+        verify(auditEventService, never()).record(
+                eq("agent-runtime.stop"), eq("agent-runtime"),
+                eq("conv-a"), eq("conv-a"), anyString());
     }
 
     @Test

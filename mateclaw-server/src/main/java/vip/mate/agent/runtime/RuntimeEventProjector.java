@@ -1,6 +1,7 @@
 package vip.mate.agent.runtime;
 
 import vip.mate.agent.AgentService;
+import vip.mate.agent.runtime.contract.RuntimeContextUsage;
 import vip.mate.agent.runtime.contract.RuntimeEvent;
 import vip.mate.agent.runtime.contract.RuntimeEventType;
 
@@ -31,7 +32,7 @@ public final class RuntimeEventProjector {
                     rename(data, "callId", "toolCallId", "toolName", "toolName"));
             case SUBAGENT_STARTED -> AgentService.StreamDelta.event("subagent_start", data);
             case SUBAGENT_FINISHED -> AgentService.StreamDelta.event("subagent_complete", data);
-            case CONTEXT_USAGE -> AgentService.StreamDelta.event("_usage_final", data);
+            case CONTEXT_USAGE -> AgentService.StreamDelta.event("_usage_final", usageData(data));
             case COMPLETED -> AgentService.StreamDelta.event("done", data);
             case FAILED -> AgentService.StreamDelta.event("error", data);
             case CANCELLED -> AgentService.StreamDelta.event("cancelled", data);
@@ -59,5 +60,16 @@ public final class RuntimeEventProjector {
 
     private static void copyIfPresent(Map<String, Object> data, String from, String to) {
         if (!data.containsKey(to) && data.containsKey(from)) data.put(to, data.get(from));
+    }
+
+    private static Map<String, Object> usageData(Map<String, Object> source) {
+        Object usage = source.get("usage");
+        if (!(usage instanceof RuntimeContextUsage contextUsage)) {
+            return source;
+        }
+        Map<String, Object> result = new LinkedHashMap<>(source);
+        result.remove("usage");
+        result.putAll(contextUsage.toEventData());
+        return result;
     }
 }

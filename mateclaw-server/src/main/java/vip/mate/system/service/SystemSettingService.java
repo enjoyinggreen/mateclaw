@@ -101,6 +101,8 @@ public class SystemSettingService {
 
     /** Managed DeepSeek Harness runtime configuration. */
     public static final String DSH_API_KEY_KEY = "dsh.api_key";
+    /** Managed Copilot authentication token; encrypted through the same settings path. */
+    public static final String COPILOT_GITHUB_TOKEN_KEY = "copilot.github_token";
 
     private static final String ZHIPU_API_KEY_KEY = "zhipuApiKey";
     private static final String ZHIPU_BASE_URL_KEY = "zhipuBaseUrl";
@@ -119,7 +121,7 @@ public class SystemSettingService {
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             SERPER_API_KEY_KEY, TAVILY_API_KEY_KEY, WEIXINOA_APP_SECRET_KEY,
             ZHIPU_API_KEY_KEY, FAL_API_KEY_KEY, KLING_ACCESS_KEY_KEY, KLING_SECRET_KEY_KEY,
-            RUNWAY_API_KEY_KEY, MINIMAX_API_KEY_KEY, DSH_API_KEY_KEY);
+            RUNWAY_API_KEY_KEY, MINIMAX_API_KEY_KEY, DSH_API_KEY_KEY, COPILOT_GITHUB_TOKEN_KEY);
 
     private final SystemSettingMapper systemSettingMapper;
     private final SearchProviderRegistry searchProviderRegistry;

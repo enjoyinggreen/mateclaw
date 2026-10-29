@@ -51,9 +51,11 @@ import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useMediaQuery, BREAKPOINTS } from '@/composables/useBreakpoint'
 import { useI18n } from 'vue-i18n'
+import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
 
 const route = useRoute()
 const { t } = useI18n()
+const workspaceStore = useWorkspaceStore()
 
 // The desktop preload bridge marks that we run inside the desktop shell.
 const isDesktop = typeof window !== 'undefined' && !!window.mateClawAPI
@@ -102,6 +104,12 @@ const sections = computed(() => [
     path: '/settings/dsh',
     label: t('settings.sections.dsh', 'DeepSeek Harness'),
     icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/></svg>',
+  },
+  {
+    id: 'copilot',
+    path: '/settings/copilot',
+    label: t('settings.sections.copilot', 'GitHub Copilot'),
+    icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3"/><circle cx="15" cy="8" r="3"/><path d="M3 20c0-3 2-5 5-5h8c3 0 5 2 5 5"/></svg>',
   },
   {
     id: 'image',
@@ -239,7 +247,7 @@ const sections = computed(() => [
     label: t('settings.sections.about'),
     icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>',
   },
-])
+].filter((section) => section.id !== 'copilot' || workspaceStore.isGlobalAdmin))
 
 function isActive(path: string) {
   return route.path === path

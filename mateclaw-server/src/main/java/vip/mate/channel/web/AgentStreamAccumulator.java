@@ -35,6 +35,9 @@ import java.util.regex.Pattern;
  */
 @Slf4j
 public final class AgentStreamAccumulator {
+    private static final Set<String> RUNTIME_OUTCOMES = Set.of("completed", "failed", "cancelled");
+    private static final List<String> USAGE_FIELDS =
+            List.of("promptTokens", "completionTokens", "contextTokens", "contextWindow");
 
     /**
      * Live fan-out hooks. The accumulator itself only builds the persisted
@@ -75,8 +78,16 @@ public final class AgentStreamAccumulator {
     private int cacheReadTokens = 0;
     private int cacheWriteTokens = 0;
     private int reasoningTokens = 0;
+    private long contextTokens = 0;
+    private long contextWindow = 0;
+    private Map<String, Boolean> usageAvailability = Map.of();
+    private boolean hasUsageAvailability = false;
     private String runtimeModelName = "";
     private String runtimeProviderId = "";
+    private String runtimeExecutionId = "";
+    private Object assistantMessageId;
+    private String runtimeOutcome = "";
+    private String runtimeErrorMessage = "";
     private boolean awaitingApproval = false;
     private String currentPhase = "";
     /**
@@ -121,19 +132,24 @@ public final class AgentStreamAccumulator {
         if (delta == null) return;
 
         if (delta.isEvent()) {
+            Map<String, Object> eventData =
+                    delta.eventData() == null ? Map.of() : delta.eventData();
+            captureRuntimeMetadata(delta.eventType(), eventData);
             if ("_usage_final".equals(delta.eventType())) {
-                Map<String, Object> data = delta.eventData();
-                promptTokens = ((Number) data.getOrDefault("promptTokens", 0)).intValue();
-                completionTokens = ((Number) data.getOrDefault("completionTokens", 0)).intValue();
-                cacheReadTokens = ((Number) data.getOrDefault("cacheReadTokens", 0)).intValue();
-                cacheWriteTokens = ((Number) data.getOrDefault("cacheWriteTokens", 0)).intValue();
-                reasoningTokens = ((Number) data.getOrDefault("reasoningTokens", 0)).intValue();
-                runtimeModelName = String.valueOf(data.getOrDefault("runtimeModelName", ""));
-                runtimeProviderId = String.valueOf(data.getOrDefault("runtimeProviderId", ""));
+                usageAvailability = readUsageAvailability(eventData);
+                validateAvailableUsage(eventData, usageAvailability);
+                promptTokens = numericValue(eventData, "promptTokens").intValue();
+                completionTokens = numericValue(eventData, "completionTokens").intValue();
+                cacheReadTokens = numericValue(eventData, "cacheReadTokens").intValue();
+                cacheWriteTokens = numericValue(eventData, "cacheWriteTokens").intValue();
+                reasoningTokens = numericValue(eventData, "reasoningTokens").intValue();
+                contextTokens = numericValue(eventData, "contextTokens").longValue();
+                contextWindow = numericValue(eventData, "contextWindow").longValue();
+                hasUsageAvailability = true;
                 return;
             }
             if ("phase".equals(delta.eventType())) {
-                String phase = String.valueOf(delta.eventData().getOrDefault("phase", ""));
+                String phase = String.valueOf(eventData.getOrDefault("phase", ""));
                 if (!phase.isBlank()) {
                     currentPhase = phase;
                     sink.updatePhase(conversationId, phase);
@@ -142,7 +158,7 @@ public final class AgentStreamAccumulator {
                 }
             }
             if ("finish_reason".equals(delta.eventType())) {
-                Object reason = delta.eventData().get("reason");
+                Object reason = eventData.get("reason");
                 if (reason != null) {
                     // Last-write-wins: graph normally fires this exactly once
                     // at FinalAnswerNode completion. Replay paths that re-enter
@@ -158,18 +174,18 @@ public final class AgentStreamAccumulator {
                 // live (via the sink fall-through below) so an
                 // already-mounted UI sees it instantly without
                 // waiting for the message-save round trip.
-                feedbackEvent = delta.eventData();
+                feedbackEvent = eventData;
             }
             if (GraphEventPublisher.EVENT_ROUTING_DECISION.equals(delta.eventType())) {
                 // Captured at turn start; persisted under metadata.routing so the
                 // chat UI can render which sidecar (if any) was invoked. Internal
                 // event — return early to skip rebroadcast on IM channels.
-                routingDecision = delta.eventData();
+                routingDecision = eventData;
                 return;
             }
-            accumulateToolEvent(delta.eventType(), delta.eventData(), conversationId);
+            accumulateToolEvent(delta.eventType(), eventData, conversationId);
             try {
-                sink.broadcast(conversationId, delta.eventType(), delta.eventData());
+                sink.broadcast(conversationId, delta.eventType(), eventData);
             } catch (Exception e) {
                 log.warn("Failed to broadcast event {}: {}", delta.eventType(), e.getMessage());
             }
@@ -239,6 +255,78 @@ public final class AgentStreamAccumulator {
     }
 
     public boolean isAwaitingApproval() { return awaitingApproval; }
+
+    private void captureRuntimeMetadata(String eventType, Map<String, Object> data) {
+        Object executionId = data.get("runtimeExecutionId");
+        if (runtimeExecutionId.isBlank() && executionId != null && !executionId.toString().isBlank()) {
+            runtimeExecutionId = executionId.toString();
+        }
+        Object markerId = data.get("assistantMessageId");
+        if (assistantMessageId == null && markerId != null) {
+            assistantMessageId = markerId;
+        }
+        Object providerId = data.get("runtimeProviderId");
+        if (providerId != null && !providerId.toString().isBlank()) {
+            runtimeProviderId = providerId.toString();
+        }
+        Object modelName = data.get("runtimeModelName");
+        if (modelName != null && !modelName.toString().isBlank()) {
+            runtimeModelName = modelName.toString();
+        }
+        if (runtimeOutcome.isBlank()
+                && ("done".equals(eventType) || "error".equals(eventType) || "cancelled".equals(eventType))) {
+            Object proposedOutcome = data.get("runtimeOutcome");
+            if (proposedOutcome != null && RUNTIME_OUTCOMES.contains(proposedOutcome.toString())) {
+                runtimeOutcome = proposedOutcome.toString();
+            }
+        }
+        if ("error".equals(eventType)) {
+            Object message = data.get("message");
+            if (message != null && !message.toString().isBlank()) {
+                runtimeErrorMessage = message.toString();
+            }
+        }
+    }
+
+    private static Number numericValue(Map<String, Object> data, String key) {
+        Object value = data.get(key);
+        if (value == null) {
+            return 0;
+        }
+        if (value instanceof Number number) {
+            return number;
+        }
+        throw new IllegalArgumentException("Usage field must be numeric: " + key);
+    }
+
+    private static Map<String, Boolean> readUsageAvailability(Map<String, Object> data) {
+        Object explicitAvailability = data.get("usageAvailability");
+        if (data.containsKey("usageAvailability") && !(explicitAvailability instanceof Map<?, ?>)) {
+            throw new IllegalArgumentException("Usage availability must be a map");
+        }
+        Map<?, ?> explicitMap = explicitAvailability instanceof Map<?, ?> map ? map : null;
+        Map<String, Boolean> result = new LinkedHashMap<>();
+        for (String field : USAGE_FIELDS) {
+            if (explicitMap != null) {
+                Object available = explicitMap.get(field);
+                if (explicitMap.containsKey(field) && !(available instanceof Boolean)) {
+                    throw new IllegalArgumentException("Usage availability must be boolean: " + field);
+                }
+                result.put(field, Boolean.TRUE.equals(available));
+            } else {
+                result.put(field, data.containsKey(field) && data.get(field) != null);
+            }
+        }
+        return Map.copyOf(result);
+    }
+
+    private static void validateAvailableUsage(Map<String, Object> data, Map<String, Boolean> availability) {
+        for (String field : USAGE_FIELDS) {
+            if (Boolean.TRUE.equals(availability.get(field)) && !(data.get(field) instanceof Number)) {
+                throw new IllegalArgumentException("Available usage field must be numeric: " + field);
+            }
+        }
+    }
 
     private void accumulateToolEvent(String eventType, Map<String, Object> data, String conversationId) {
         if ("tool_approval_requested".equals(eventType)) {
@@ -454,6 +542,33 @@ public final class AgentStreamAccumulator {
     public int getReasoningTokens() { return reasoningTokens; }
     public String getRuntimeModelName() { return runtimeModelName; }
     public String getRuntimeProviderId() { return runtimeProviderId; }
+    public String getRuntimeExecutionId() { return runtimeExecutionId; }
+    public Long getAssistantMessageId() {
+        return assistantMessageId instanceof Number number ? number.longValue() : null;
+    }
+    public String getRuntimeOutcome() { return runtimeOutcome; }
+    public String getRuntimeErrorMessage() { return runtimeErrorMessage; }
+    public boolean isCopilotTurn() {
+        return "copilot".equalsIgnoreCase(runtimeProviderId);
+    }
+
+    public void ensureCopilotOutcome(String outcome) {
+        if (!RUNTIME_OUTCOMES.contains(outcome)) {
+            throw new IllegalArgumentException("Invalid Copilot runtime outcome");
+        }
+        if (runtimeOutcome.isBlank()) {
+            runtimeOutcome = outcome;
+        }
+    }
+
+    public void associateCopilotTurn(String executionId, Long markerId) {
+        if (executionId == null || executionId.isBlank() || markerId == null || markerId <= 0) {
+            throw new IllegalArgumentException("Copilot execution and assistant marker IDs are required");
+        }
+        runtimeExecutionId = executionId;
+        assistantMessageId = markerId;
+        runtimeProviderId = "copilot";
+    }
     public String getCurrentPhase() { return currentPhase; }
     public String getFinishReason() { return finishReason; }
     public boolean segmentsEmpty() { return segments.isEmpty(); }
@@ -520,6 +635,39 @@ public final class AgentStreamAccumulator {
             }
             if (!currentPhase.isBlank()) {
                 metadata.put("currentPhase", currentPhase);
+            }
+            if (!runtimeExecutionId.isBlank()) {
+                metadata.put("runtimeExecutionId", runtimeExecutionId);
+            }
+            if (assistantMessageId != null) {
+                metadata.put("assistantMessageId", assistantMessageId);
+            }
+            if (!runtimeOutcome.isBlank()) {
+                metadata.put("runtimeOutcome", runtimeOutcome);
+            }
+            if (!runtimeErrorMessage.isBlank()) {
+                metadata.put("runtimeErrorMessage", runtimeErrorMessage);
+            }
+            if (!runtimeProviderId.isBlank()) {
+                metadata.put("runtimeProviderId", runtimeProviderId);
+            }
+            if (!runtimeModelName.isBlank()) {
+                metadata.put("runtimeModelName", runtimeModelName);
+            }
+            if (hasUsageAvailability) {
+                metadata.put("usageAvailability", usageAvailability);
+                if (Boolean.TRUE.equals(usageAvailability.get("promptTokens"))) {
+                    metadata.put("promptTokens", promptTokens);
+                }
+                if (Boolean.TRUE.equals(usageAvailability.get("completionTokens"))) {
+                    metadata.put("completionTokens", completionTokens);
+                }
+                if (Boolean.TRUE.equals(usageAvailability.get("contextTokens"))) {
+                    metadata.put("contextTokens", contextTokens);
+                }
+                if (Boolean.TRUE.equals(usageAvailability.get("contextWindow"))) {
+                    metadata.put("contextWindow", contextWindow);
+                }
             }
             if (planId != null || !planSteps.isEmpty() || currentPlanStep != null) {
                 Map<String, Object> plan = new LinkedHashMap<>();

@@ -156,6 +156,12 @@ const router = createRouter({
               meta: { title: 'Settings - DeepSeek Harness', requiredCapability: 'manage:settings' },
             },
             {
+              path: 'copilot',
+              name: 'SettingsCopilot',
+              component: () => import('@/views/Settings/Copilot/index.vue'),
+              meta: { title: 'Settings - GitHub Copilot', requireAdmin: true },
+            },
+            {
               path: 'image',
               name: 'SettingsImage',
               component: () => import('@/views/Settings/Image/index.vue'),

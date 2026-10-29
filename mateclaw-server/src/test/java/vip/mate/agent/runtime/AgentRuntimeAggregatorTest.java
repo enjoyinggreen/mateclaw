@@ -67,6 +67,30 @@ class AgentRuntimeAggregatorTest {
         assertThat(aggregator.runBelongsToWorkspace("missing", WORKSPACE_A)).isFalse();
     }
 
+    @Test
+    void runProviderRemainsTheProviderCapturedAtStartAfterAgentEdits() {
+        ChatStreamTracker tracker = new ChatStreamTracker(new ObjectMapper());
+        tracker.register("conv-copilot");
+        tracker.bindRunMeta("conv-copilot", 300L, "alice", "copilot");
+
+        AgentEntity currentAgent = agent(300L, WORKSPACE_A, "Copilot agent");
+        currentAgent.setRuntimeType("native");
+        AgentService agents = mock(AgentService.class);
+        when(agents.getAgent(300L)).thenReturn(currentAgent);
+        AgentRuntimeAggregator aggregator = new AgentRuntimeAggregator(
+                tracker, new SubagentRegistry(), agents);
+
+        assertThat(aggregator.snapshot(WORKSPACE_A).runs())
+                .singleElement()
+                .satisfies(card -> assertThat(card.runtimeProvider()).isEqualTo("copilot"));
+
+        currentAgent.setRuntimeType("dsh");
+
+        assertThat(aggregator.snapshot(WORKSPACE_A).runs())
+                .singleElement()
+                .satisfies(card -> assertThat(card.runtimeProvider()).isEqualTo("copilot"));
+    }
+
     private static AgentEntity agent(Long id, Long workspaceId, String name) {
         AgentEntity agent = new AgentEntity();
         agent.setId(id);

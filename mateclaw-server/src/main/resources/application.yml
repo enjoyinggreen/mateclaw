@@ -3,6 +3,12 @@ server:
   servlet:
     context-path: /
 
+# The SDK may attach provider diagnostics to log events; application errors use
+# the stable, redacted copilot.* vocabulary instead.
+logging:
+  level:
+    com.github.copilot: OFF
+
 spring:
   http:
     converters:
@@ -154,6 +160,15 @@ mateclaw:
   # outside the Spring classpath and can be supplied by environment variables.
   agent:
     runtime:
+        copilot:
+          enabled: ${MATECLAW_COPILOT_ENABLED:false}
+          cli-path: ${MATECLAW_COPILOT_CLI_PATH:}
+          model-name: ${MATECLAW_COPILOT_MODEL_NAME:}
+          github-token: ${MATECLAW_COPILOT_GITHUB_TOKEN:}
+          state-root: ${MATECLAW_COPILOT_STATE_ROOT:${java.io.tmpdir}/mateclaw/copilot}
+          initialize-timeout-ms: ${MATECLAW_COPILOT_INITIALIZE_TIMEOUT_MS:30000}
+          idle-timeout-ms: ${MATECLAW_COPILOT_IDLE_TIMEOUT_MS:180000}
+          stop-timeout-ms: ${MATECLAW_COPILOT_STOP_TIMEOUT_MS:5000}
         dsh:
           containment:
             mode: ${MATECLAW_DSH_CONTAINMENT_MODE:native}

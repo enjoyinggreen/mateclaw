@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import vip.mate.channel.web.Utf8SseEmitter;
@@ -29,11 +30,13 @@ import vip.mate.workspace.core.annotation.RequireWorkspaceRole;
 import vip.mate.workspace.core.service.WorkspaceService;
 import vip.mate.agent.context.ChatOrigin;
 import vip.mate.workspace.conversation.ConversationService;
+import vip.mate.workspace.conversation.model.ConversationEntity;
 import vip.mate.workspace.conversation.model.MessageEntity;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -92,6 +95,15 @@ public class AgentController {
             @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         AgentEntity agent = agentService.getAgent(id);
         verifyResourceWorkspace(agent.getWorkspaceId(), workspaceId);
+
+        if ("copilot".equalsIgnoreCase(agent.getRuntimeType())) {
+            return R.ok(AgentCapabilitiesVO.builder()
+                    .agentId(id)
+                    .modelName(agentService.resolveCopilotModelName(agent, null))
+                    .providerId("copilot")
+                    .modalities(List.of())
+                    .build());
+        }
 
         ModelConfigEntity primary;
         try {
@@ -171,6 +183,15 @@ public class AgentController {
         AgentEntity agent = objectMapper.convertValue(body, AgentEntity.class);
         if (!body.containsKey("primaryKbId")) {
             agent.setPrimaryKbId(existing.getPrimaryKbId());
+        }
+        if (!body.containsKey("runtimeType")) {
+            agent.setRuntimeType(existing.getRuntimeType());
+        }
+        if (!body.containsKey("runtimeConfig")) {
+            agent.setRuntimeConfig(existing.getRuntimeConfig());
+        }
+        if (!body.containsKey("modelName")) {
+            agent.setModelName(existing.getModelName());
         }
         agent.setId(id);
         agent.setWorkspaceId(existing.getWorkspaceId()); // 不允许跨 workspace 迁移
@@ -281,11 +302,45 @@ public class AgentController {
         Long resolvedWorkspaceId = agent != null && agent.getWorkspaceId() != null
                 ? agent.getWorkspaceId()
                 : requestedWorkspaceId != null ? requestedWorkspaceId : 1L;
+        Long requesterUserId = null;
+        if ("copilot".equalsIgnoreCase(agent.getRuntimeType())) {
+            requesterUserId = validateCopilotConversation(
+                    agent, conversationId, resolvedWorkspaceId);
+        }
         MessageEntity savedUser = conversationService.saveMessage(
                 conversationId, "user", message);
-        return ChatOrigin.web(conversationId, "anonymous", resolvedWorkspaceId, null)
+        ChatOrigin origin = ChatOrigin.web(conversationId, "anonymous", resolvedWorkspaceId, null)
                 .withAgent(agentId)
                 .withOriginMessageId(savedUser == null ? null : savedUser.getId());
+        if ("copilot".equalsIgnoreCase(agent.getRuntimeType())) {
+            origin = origin.withRequesterUserId(requesterUserId);
+        }
+        return origin;
+    }
+
+    private Long validateCopilotConversation(
+            AgentEntity agent, String conversationId, Long workspaceId) {
+        if (conversationId == null || conversationId.isBlank()) {
+            throw new MateClawException(
+                    "copilot.conversation_invalid", 400, "A Copilot conversation is required");
+        }
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        Long requesterUserId = resolveUserId(authentication);
+        String username = authentication.getName();
+        ConversationEntity conversation = conversationService.findByConversationId(conversationId);
+        if (conversation == null) {
+            conversation = conversationService.getOrCreateConversation(
+                    conversationId, agent.getId(), username, workspaceId);
+        }
+        if (conversation == null
+                || !Objects.equals(conversation.getAgentId(), agent.getId())
+                || !Objects.equals(conversation.getWorkspaceId(), workspaceId)
+                || !conversationService.isConversationOwner(conversationId, username)) {
+            throw new MateClawException(
+                    "copilot.conversation_forbidden", 403,
+                    "Conversation is not available for this Copilot employee");
+        }
+        return requesterUserId;
     }
 
     @Operation(summary = "获取Agent运行状态")

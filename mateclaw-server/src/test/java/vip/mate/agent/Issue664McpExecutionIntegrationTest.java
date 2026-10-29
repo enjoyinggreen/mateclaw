@@ -15,6 +15,7 @@ import vip.mate.agent.binding.service.AgentBindingService;
 import vip.mate.agent.context.PrefixBudgetPlan;
 import vip.mate.agent.graph.executor.ToolExecutionExecutor;
 import vip.mate.agent.model.AgentEntity;
+import vip.mate.agent.runtime.RuntimeToolSetResolver;
 import vip.mate.agent.repository.AgentMapper;
 import vip.mate.llm.model.*;
 import vip.mate.tool.ToolRegistry;
@@ -199,13 +200,16 @@ class Issue664McpExecutionIntegrationTest {
                 if (!Modifier.isStatic(field.getModifiers()) && !field.getType().isPrimitive())
                     ReflectionTestUtils.setField(builder, field.getName(), mock(field.getType()));
             }
-            var registry = (ToolRegistry) ReflectionTestUtils.getField(builder, "toolRegistry");
+            var registry = mock(ToolRegistry.class);
             var enabled = AgentToolSet.fromCallbacks(List.of(),
                     List.of(callback(A), callback(B), callback("web_search"), callback("browser_use")));
             when(registry.getEnabledToolSet()).thenReturn(enabled);
-            var guardConfig = (ToolGuardConfigService) ReflectionTestUtils.getField(builder, "toolGuardConfigService");
+            var guardConfig = mock(ToolGuardConfigService.class);
             when(guardConfig.getDeniedTools()).thenReturn(denySelected ? Set.of(A) : Set.of());
-            ReflectionTestUtils.setField(builder, "agentBindingService", bindings());
+            var bindingService = bindings();
+            ReflectionTestUtils.setField(builder, "runtimeToolSetResolver",
+                    new RuntimeToolSetResolver(registry, bindingService, guardConfig, true));
+            ReflectionTestUtils.setField(builder, "agentBindingService", bindingService);
             var provider = new ModelProviderEntity(); provider.setProviderId("fixture"); provider.setChatModel("openai-compatible");
             var model = new ModelConfigEntity(); model.setProvider("fixture"); model.setModelName("fixture");
             var models = (vip.mate.llm.service.ModelConfigService) ReflectionTestUtils.getField(builder, "modelConfigService");

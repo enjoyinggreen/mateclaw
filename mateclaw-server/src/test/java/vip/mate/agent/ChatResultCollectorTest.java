@@ -37,4 +37,25 @@ class ChatResultCollectorTest {
 
         assertEquals("normal", result.finishReason());
     }
+
+    @Test
+    void retainsCopilotFailureAndMarkerIdentityAlongsidePartialContent() {
+        AgentService.ChatResult result = ChatResultCollector.collect(Flux.just(
+                new AgentService.StreamDelta("partial answer", null),
+                AgentService.StreamDelta.event("error", Map.of(
+                        "runtimeExecutionId", "execution-7",
+                        "assistantMessageId", 7001L,
+                        "runtimeProviderId", "copilot",
+                        "runtimeModelName", "gpt-4.1",
+                        "runtimeOutcome", "failed",
+                        "message", "provider failed"))));
+
+        assertEquals("partial answer", result.content());
+        assertEquals("execution-7", result.runtimeExecutionId());
+        assertEquals(7001L, result.assistantMessageId());
+        assertEquals("copilot", result.runtimeProvider());
+        assertEquals("gpt-4.1", result.runtimeModel());
+        assertEquals("failed", result.runtimeOutcome());
+        assertEquals("provider failed", result.errorMessage());
+    }
 }

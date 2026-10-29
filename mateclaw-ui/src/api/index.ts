@@ -8,6 +8,7 @@ import type {
   CreateGrantPayload,
   ResolutionLog,
   GrantScope,
+  Message,
 } from '@/types'
 
 /**
@@ -207,7 +208,7 @@ export const conversationApi = {
   page: (params: { page?: number; size?: number; keyword?: string }) =>
     http.get('/conversations/page', { params }),
   listMessages: (conversationId: string, params?: { beforeId?: number; limit?: number; runId?: string; taskId?: string }) =>
-    http.get(`/conversations/${encId(conversationId)}/messages`, { params }),
+    http.get<{ data: Message[] }>(`/conversations/${encId(conversationId)}/messages`, { params }),
   getStatus: (conversationId: string) =>
     http.get(`/conversations/${encId(conversationId)}/status`),
   getTeamWorkerContext: (conversationId: string, params?: { runId?: string; taskId?: string }) =>
@@ -396,6 +397,7 @@ export interface LiveRunCard {
   agentId: number | null
   agentName: string | null
   agentIcon: string | null
+  runtimeProvider?: string | null
   username: string | null
   currentPhase: string | null
   runningToolName: string | null
@@ -778,6 +780,43 @@ export const dshApi = {
   rollback: (id: string, data: { expectedRevision: string; idempotencyKey: string }) => http.post(`/admin/dsh/upgrades/${encodeURIComponent(id)}/rollback`, data),
   enable: () => http.post('/admin/dsh/enable'),
   disable: () => http.post('/admin/dsh/disable'),
+}
+
+export interface CopilotRuntimeStatus {
+  type: 'copilot'
+  enabled: boolean
+  configuration: {
+    cliPath: string
+    modelName: string
+    tokenConfigured: boolean
+  }
+  readiness: {
+    state: 'disabled' | 'unchecked' | 'ready' | 'unavailable'
+    code: string
+    message: string
+    checkedAt: string | null
+  }
+  capabilities: {
+    cancellation: boolean
+    approvals: boolean
+    subagents: boolean
+    contextUsage: boolean
+  }
+}
+
+export interface CopilotRuntimeConfigUpdate {
+  enabled?: boolean
+  cliPath?: string
+  modelName?: string
+  githubToken?: string
+  clearToken?: boolean
+}
+
+export const copilotApi = {
+  status: () => http.get<CopilotRuntimeStatus>('/admin/copilot/status'),
+  saveConfig: (data: CopilotRuntimeConfigUpdate) =>
+    http.put<CopilotRuntimeStatus>('/admin/copilot/config', data),
+  verify: () => http.post<CopilotRuntimeStatus>('/admin/copilot/verify'),
 }
 
 // ==================== Global outbound proxy ====================

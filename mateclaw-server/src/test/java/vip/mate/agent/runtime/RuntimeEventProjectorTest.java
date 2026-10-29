@@ -84,4 +84,23 @@ class RuntimeEventProjectorTest {
         assertEquals("session-1", terminal.eventData().get("runtimeSessionId"));
         assertEquals(9L, terminal.eventData().get("runtimeSequence"));
     }
+
+    @Test
+    void preservesExplicitCopilotOutcomeAndAssistantMarkerOnTerminalEvents() {
+        AgentService.StreamDelta terminal = RuntimeEventProjector.project(
+                RuntimeEvent.terminal("execution-1", 10, RuntimeEventType.FAILED,
+                        Map.of(
+                                "runtimeExecutionId", "execution-1",
+                                "assistantMessageId", 73L,
+                                "runtimeOutcome", "failed",
+                                "runtimeProviderId", "copilot",
+                                "runtimeModelName", "actual-model")));
+
+        assertEquals("error", terminal.eventType());
+        assertEquals("execution-1", terminal.eventData().get("runtimeExecutionId"));
+        assertEquals(73L, terminal.eventData().get("assistantMessageId"));
+        assertEquals("failed", terminal.eventData().get("runtimeOutcome"));
+        assertEquals("copilot", terminal.eventData().get("runtimeProviderId"));
+        assertEquals("actual-model", terminal.eventData().get("runtimeModelName"));
+    }
 }

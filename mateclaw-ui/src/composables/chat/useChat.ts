@@ -18,7 +18,7 @@ import { stripCompletedPlanStepOutput } from './planStepOutput'
 import { useGoalStore } from '@/stores/useGoalStore'
 import { useSystemSettingsStore } from '@/stores/useSystemSettingsStore'
 import { storeToRefs } from 'pinia'
-import type { Message, MessageContentPart, MessageSegment, StreamPhase, HeartbeatData, QueuedMessage, PhaseEventData, DelegationNode, DelegationToolEntry, PlanMeta, GeneratedFile } from '@/types'
+import type { Message, MessageContentPart, MessageSegment, StreamPhase, HeartbeatData, QueuedMessage, PhaseEventData, DelegationNode, DelegationToolEntry, PlanMeta, GeneratedFile, UsageAvailability, MessageMetadata } from '@/types'
 import { classifyBackendError, type ChatErrorInfo } from '@/types/chatError'
 import { http } from '@/api'
 
@@ -83,6 +83,9 @@ export interface ContextUsageEvent {
   /** True when this pass will trigger history compaction. */
   willCompact: boolean
   timestamp?: number
+  /** Present for provider-reported usage; absent on estimated context_usage events. */
+  runtimeProviderId?: string
+  usageAvailability?: UsageAvailability
 }
 
 export interface UseChatOptions {
@@ -375,6 +378,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         if (typeof parsed === 'string') {
           try { parsed = JSON.parse(parsed) } catch { /* ignore */ }
         }
+
         return parsed
       } catch (e) {
         console.warn('[useChat] Failed to parse metadata:', e)
@@ -382,6 +386,21 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       }
     }
     return metadata
+  }
+
+  const normalizeUsageAvailability = (data: any, metadata: any): UsageAvailability | undefined => {
+    const raw = data?.usageAvailability ?? metadata?.usageAvailability
+    if (!raw || typeof raw !== 'object') return undefined
+    const hasNumber = (key: string) => {
+      const value = data?.[key] ?? metadata?.[key]
+      return typeof value === 'number' && Number.isFinite(value)
+    }
+    return {
+      promptTokens: raw.promptTokens === true && hasNumber('promptTokens'),
+      completionTokens: raw.completionTokens === true && hasNumber('completionTokens'),
+      contextTokens: raw.contextTokens === true && hasNumber('contextTokens'),
+      contextWindow: raw.contextWindow === true && hasNumber('contextWindow'),
+    }
   }
 
   /**
@@ -731,6 +750,43 @@ export function useChat(options: UseChatOptions): UseChatReturn {
 
   stream.on('done', (data) => {
     if (isStaleEvent(data)) return
+    const doneMetadata = parseMetadata(data.metadata)
+    const runtimeOutcome = data.runtimeOutcome ?? doneMetadata.runtimeOutcome
+    const finalStatus = runtimeOutcome === 'failed' ? 'failed'
+      : runtimeOutcome === 'cancelled' ? 'stopped'
+      : data.status || 'completed'
+    const runtimeProviderId = data.runtimeProviderId || data.runtimeProvider
+      || doneMetadata.runtimeProviderId
+    const runtimeModelName = data.runtimeModelName || data.runtimeModel
+      || doneMetadata.runtimeModelName
+    const assistantMessageId = data.assistantMessageId ?? doneMetadata.assistantMessageId
+    const usageAvailability = normalizeUsageAvailability(data, doneMetadata)
+      ?? (runtimeProviderId === 'copilot'
+        ? { promptTokens: false, completionTokens: false, contextTokens: false, contextWindow: false }
+        : undefined)
+    const finalValue = (key: string) => data[key] ?? doneMetadata[key]
+
+    if (runtimeProviderId === 'copilot' && usageAvailability) {
+      const contextTokens = usageAvailability.contextTokens ? finalValue('contextTokens') : undefined
+      const contextWindow = usageAvailability.contextWindow ? finalValue('contextWindow') : undefined
+      const hasContext = typeof contextTokens === 'number' && typeof contextWindow === 'number'
+        && Number.isFinite(contextTokens) && Number.isFinite(contextWindow)
+      const usedTokens = hasContext ? contextTokens : 0
+      const windowTokens = hasContext ? contextWindow : 0
+      contextUsage.value = {
+        windowTokens,
+        usedTokens,
+        systemTokens: 0,
+        toolsTokens: 0,
+        historyTokens: 0,
+        currentTokens: 0,
+        ratio: windowTokens > 0 ? usedTokens / windowTokens : 0,
+        willCompact: false,
+        timestamp: data.timestamp,
+        runtimeProviderId,
+        usageAvailability,
+      }
+    }
 
     // Non-streamed turn: reveal the buffered content/segments now, before the
     // server-annotation merge below reads metadata.segments.
@@ -739,23 +795,65 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     if (currentAssistantId.value) {
       const existingMsg = getMessage(currentAssistantId.value)
       if (existingMsg?.status !== 'failed') {
-        setMessageStatus(currentAssistantId.value, data.status || 'completed')
+        setMessageStatus(currentAssistantId.value, finalStatus)
       }
 
       // Update token counts + replace the local temp ID with the backend-persisted ID (critical: enables reconcile by ID)
       const msgIndex = messages.value.findIndex(m => m.id === currentAssistantId.value)
       if (msgIndex >= 0) {
         const msg = messages.value[msgIndex]
-        if (data.promptTokens !== undefined) msg.promptTokens = data.promptTokens
-        if (data.completionTokens !== undefined) msg.completionTokens = data.completionTokens
+        const promptTokens = finalValue('promptTokens')
+        const completionTokens = finalValue('completionTokens')
+        const availabilityAware = !!usageAvailability || runtimeProviderId === 'copilot'
+        if (availabilityAware) {
+          if (usageAvailability?.promptTokens && typeof promptTokens === 'number') msg.promptTokens = promptTokens
+          else delete msg.promptTokens
+          if (usageAvailability?.completionTokens && typeof completionTokens === 'number') {
+            msg.completionTokens = completionTokens
+          } else delete msg.completionTokens
+        } else {
+          if (promptTokens !== undefined) msg.promptTokens = promptTokens
+          if (completionTokens !== undefined) msg.completionTokens = completionTokens
+        }
         if (data.cacheReadTokens !== undefined) msg.cacheReadTokens = data.cacheReadTokens
         if (data.cacheWriteTokens !== undefined) msg.cacheWriteTokens = data.cacheWriteTokens
         if (data.reasoningTokens !== undefined) msg.reasoningTokens = data.reasoningTokens
-        if (data.runtimeModel) msg.runtimeModel = data.runtimeModel
-        if (data.runtimeProvider) msg.runtimeProvider = data.runtimeProvider
+        if (runtimeModelName) msg.runtimeModel = runtimeModelName
+        if (runtimeProviderId) msg.runtimeProvider = runtimeProviderId
+        const metadata = parseMetadata((msg as any).metadata)
+        const nextMetadata: MessageMetadata = {
+          ...metadata,
+          ...(data.runtimeExecutionId || doneMetadata.runtimeExecutionId
+            ? { runtimeExecutionId: data.runtimeExecutionId || doneMetadata.runtimeExecutionId }
+            : {}),
+          ...(assistantMessageId != null
+            ? { assistantMessageId }
+            : {}),
+          ...(runtimeOutcome ? { runtimeOutcome } : {}),
+          ...(runtimeProviderId ? { runtimeProviderId } : {}),
+          ...(runtimeModelName ? { runtimeModelName } : {}),
+          ...(data.runtimeErrorMessage || doneMetadata.runtimeErrorMessage
+            ? { runtimeErrorMessage: data.runtimeErrorMessage || doneMetadata.runtimeErrorMessage }
+            : {}),
+          ...(usageAvailability ? { usageAvailability } : {}),
+        }
+        if (availabilityAware) {
+          for (const [field, available] of Object.entries(usageAvailability || {}) as Array<[keyof UsageAvailability, boolean]>) {
+            const value = finalValue(field)
+            if (available && typeof value === 'number') {
+              nextMetadata[field] = value
+            } else {
+              delete nextMetadata[field]
+            }
+          }
+        } else {
+          if (promptTokens !== undefined) nextMetadata.promptTokens = promptTokens
+          if (completionTokens !== undefined) nextMetadata.completionTokens = completionTokens
+        }
+        msg.metadata = nextMetadata
         // Replace the local temp ID with the backend-persisted ID so reconcile can match by ID
-        if (data.assistantMessageId) {
-          msg.id = data.assistantMessageId
+        if (assistantMessageId != null) {
+          msg.id = assistantMessageId
         }
         // Merge server-authoritative segment annotations (carries fields the
         // live SSE path can't compute, like the 'superseded' marker the
@@ -774,7 +872,6 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         // artifacts that the server pruned) end up unmatched and pass
         // through untouched — no risk of mislabelling.
         if (Array.isArray(data.segments) && data.segments.length > 0) {
-          const metadata = parseMetadata((msg as any).metadata)
           const localSegs = (metadata?.segments as any[]) || []
           if (localSegs.length > 0) {
             const serverByTypeIndex = new Map<string, any>()
@@ -827,37 +924,40 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     }
 
     streamPhase.value = errorFired ? 'idle'
-      : data.status === 'awaiting_approval' ? 'awaiting_approval'
-      : data.status === 'stopped' ? 'stopped' : 'completed'
-    if (data.status !== 'awaiting_approval') {
+      : finalStatus === 'awaiting_approval' ? 'awaiting_approval'
+      : finalStatus === 'stopped' ? 'stopped'
+      : finalStatus === 'failed' ? 'idle' : 'completed'
+    if (finalStatus !== 'awaiting_approval') {
       phaseInfo.value = null
       compactStatus.value = null
       lifecycleStage.value = null
       // An error may be followed by a protocol-level done event. Its status
       // does not resolve an approval or turn the failed request into success.
       if (!errorFired) {
-        expirePendingApprovals(data.status === 'stopped' ? 'stopped' : 'completed')
+        expirePendingApprovals(finalStatus === 'stopped' ? 'stopped'
+          : finalStatus === 'failed' ? 'failed' : 'completed')
       }
     }
 
     // Safety cleanup for queue state (no-op if queued_input_started already handled it)
     if (!messageQueue.hasQueued.value) {
       // Queue already empty — phase cannot linger at 'queued'
-    } else if (data.status === 'stopped') {
-      // User-initiated stop — discard queued message
+    } else if (finalStatus === 'stopped' || finalStatus === 'failed') {
+      // Terminal failure or stop — discard queued message
       messageQueue.clear()
     }
 
     // Fire unified onStreamEnd
-    const reason = data.status === 'stopped' ? 'stopped'
-      : data.status === 'interrupted' ? 'interrupted'
-      : data.status === 'awaiting_approval' ? 'awaiting_approval'
+    const reason = finalStatus === 'failed' ? 'failed'
+      : finalStatus === 'stopped' ? 'stopped'
+      : finalStatus === 'interrupted' ? 'interrupted'
+      : finalStatus === 'awaiting_approval' ? 'awaiting_approval'
       : 'completed'
     if (!errorFired) {
       onStreamEnd?.({
         conversationId: data.conversationId || streamConversationId,
         reason,
-        assistantMessageId: data.assistantMessageId,
+        assistantMessageId,
         persisted: data.persisted,
         messageCount: data.messageCount,
       })
@@ -867,9 +967,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     // async_task_completed event reaches us live (otherwise the user has to
     // refresh). Skip if we're already in a reconnect cycle, or for non-completed
     // terminal statuses where reconnect is misleading.
-    const reconnectableStatus = !data.status
-      || data.status === 'completed'
-      || data.status === 'idle'
+    const reconnectableStatus = finalStatus === 'completed'
+      || finalStatus === 'idle'
     if (!errorFired && reconnectableStatus
         && !reconnectingForAsyncTasks
         && pendingAsyncTaskIds.size > 0

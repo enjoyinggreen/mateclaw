@@ -6,6 +6,7 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
+import vip.mate.workspace.conversation.ConversationService;
 
 /**
  * Conversation runtime data fixes (executed every startup).
@@ -19,10 +20,12 @@ import org.springframework.stereotype.Component;
 public class ConversationSchemaMigration implements ApplicationRunner {
 
     private final JdbcTemplate jdbcTemplate;
+    private final ConversationService conversationService;
 
     @Override
     public void run(org.springframework.boot.ApplicationArguments args) throws Exception {
         resetOrphanedStreams();
+        conversationService.reconcileOrphanedCopilotTurns();
         normalizeSharedChannelConversationOwners();
     }
 

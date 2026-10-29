@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -848,6 +849,8 @@ public class ChannelMessageRouter {
             // 紧接着 refreshCurrentConversationMessages 的 reconcile 能按 id 干净匹配，不会走"认领"兜底
             // 导致气泡丢失。
             Long savedAssistantId = null;
+            String terminalStatus = "completed";
+            Map<String, Object> terminalMetadata = new HashMap<>();
             try {
                 // 流式路径：渠道实现了 StreamingChannelAdapter 则委托渠道渲染流式事件
                 // RFC-063r §2.5: build the ChatOrigin once per channel-message
@@ -858,7 +861,13 @@ public class ChannelMessageRouter {
                         .withOriginMessageId(savedUser == null ? null : savedUser.getId());
 
                 if (adapter instanceof StreamingChannelAdapter streamingAdapter) {
-                    savedAssistantId = processWithStreaming(message, streamingAdapter, conversationId, agentId, promptText, channelEntity, chatOrigin);
+                    ProcessResult result = processWithStreaming(
+                            message, streamingAdapter, conversationId, agentId, promptText, channelEntity, chatOrigin);
+                    savedAssistantId = result.assistantMessageId();
+                    terminalMetadata.putAll(result.runtimeMetadata());
+                    if ("copilot".equals(terminalMetadata.get("runtimeProviderId"))) {
+                        terminalStatus = result.status();
+                    }
                 } else {
                     // Sync path for non-streaming IM adapters (weixin / slack /
                     // discord / qq / telegram). We can't use agentService.chat()
@@ -886,6 +895,13 @@ public class ChannelMessageRouter {
                     // and IM channels still need the text for the outgoing reply),
                     // segmentOnly narration excluded (issue #120).
                     AgentStreamAccumulator accumulator = newAccumulator();
+                    CopilotTurnMarker copilotTurn =
+                            beginCopilotTurnIfSelected(agentId, conversationId, chatOrigin);
+                    if (copilotTurn != null) {
+                        accumulator.associateCopilotTurn(
+                                copilotTurn.executionId(), copilotTurn.assistantMessageId());
+                        terminalMetadata.putAll(runtimeMetadata(accumulator));
+                    }
                     // Narration lifecycle: relayed messages on this path are
                     // permanent (IM messages cannot be retracted), so per-stage
                     // narration publishes one behind through the shared tracker —
@@ -894,8 +910,14 @@ public class ChannelMessageRouter {
                     // reaching the user verbatim.
                     final ProvisionalContentTracker narrationTracker =
                             new ProvisionalContentTracker(channelType);
-                    agentService.chatStructuredStream(agentId, promptText, conversationId,
-                                    message.getSenderId(), chatOrigin)
+                    try {
+                        reactor.core.publisher.Flux<AgentService.StreamDelta> runtimeStream = copilotTurn == null
+                                ? agentService.chatStructuredStream(agentId, promptText, conversationId,
+                                        message.getSenderId(), chatOrigin)
+                                : agentService.chatStructuredStream(agentId, promptText, conversationId,
+                                        message.getSenderId(), null, chatOrigin,
+                                        copilotTurn.executionId(), copilotTurn.assistantMessageId());
+                        runtimeStream
                             .doOnNext(delta -> {
                                 accumulator.accept(delta, conversationId);
                                 if (delta.isEvent()) {
@@ -918,6 +940,17 @@ public class ChannelMessageRouter {
                                 }
                             })
                             .blockLast(Duration.ofMinutes(10));
+                    } catch (RuntimeException error) {
+                        if (copilotTurn != null) {
+                            accumulator.ensureCopilotOutcome("failed");
+                            terminalStatus = "failed";
+                            terminalMetadata.putAll(runtimeMetadata(accumulator));
+                            persistAssistantTurn(conversationId,
+                                    "[错误] " + (error.getMessage() == null ? "channel runtime failed" : error.getMessage()),
+                                    accumulator.toAssistantParts(), "failed", accumulator);
+                        }
+                        throw error;
+                    }
                     String reply = accumulator.getContent();
                     // The last narration was held back until the answer was
                     // known: superseded → dropped, otherwise it still goes out
@@ -963,26 +996,37 @@ public class ChannelMessageRouter {
                         // from the next turn's LLM history, breaking the self-replicating
                         // 400 loop. Only successful replies fire the ConversationCompletedEvent —
                         // error turns must not pollute memory extraction.
-                        boolean isError = errorClassifier.isErrorReply(reply);
-                        String status = isError ? "error" : "completed";
+                        boolean isError = "failed".equals(accumulator.getRuntimeOutcome())
+                                || errorClassifier.isErrorReply(reply);
+                        if (accumulator.isCopilotTurn() && accumulator.getRuntimeOutcome().isBlank()) {
+                            accumulator.ensureCopilotOutcome(isError ? "failed" : "completed");
+                        }
+                        boolean isCancelled = accumulator.isCopilotTurn()
+                                && "cancelled".equals(accumulator.getRuntimeOutcome());
+                        String status = accumulator.isCopilotTurn()
+                                ? isError ? "failed" : isCancelled ? "stopped" : "completed"
+                                : isError ? "error" : "completed";
+                        if (accumulator.isCopilotTurn()) {
+                            terminalStatus = status;
+                            terminalMetadata.putAll(runtimeMetadata(accumulator));
+                        }
                         // Persist the full execution record (parts + metadata)
                         // so the Web console renders IM-routed turns exactly
                         // like Web direct chats. The content column keeps the
                         // scrubbed reply text that actually went out.
-                        MessageEntity saved = conversationService.saveMessage(
-                                conversationId, "assistant", reply,
-                                accumulator.toAssistantParts(), status,
-                                accumulator.getPromptTokens(), accumulator.getCompletionTokens(),
-                                accumulator.getCacheReadTokens(), accumulator.getCacheWriteTokens(),
-                                accumulator.getReasoningTokens(),
-                                blankToNull(accumulator.getRuntimeModelName()),
-                                blankToNull(accumulator.getRuntimeProviderId()),
-                                accumulator.toMetadataJson());
+                        MessageEntity saved = persistAssistantTurn(conversationId, reply,
+                                accumulator.toAssistantParts(), status, accumulator);
                         savedAssistantId = saved != null ? saved.getId() : null;
-                        if (!isError) {
+                        if (!isError && !isCancelled) {
                             publishConversationCompletedEvent(agentId, conversationId, message.getContent(), reply, chatOrigin);
                         }
-                        adapter.renderAndSend(replyTarget, reply);
+                        if (copilotTurn == null || (reply != null && !reply.isBlank())) {
+                            adapter.renderAndSend(replyTarget, reply);
+                        } else if (replyTarget != null) {
+                            adapter.sendMessage(replyTarget, accumulator.getRuntimeErrorMessage().isBlank()
+                                    ? "Copilot runtime did not produce a reply"
+                                    : accumulator.getRuntimeErrorMessage());
+                        }
                         log.info("[{}] Reply sent to {}: {}chars",
                                 adapter.getChannelType(), replyTarget, reply.length());
 
@@ -991,6 +1035,8 @@ public class ChannelMessageRouter {
                         Map<String, Object> msgCompletePayload = new HashMap<>();
                         msgCompletePayload.put("conversationId", conversationId);
                         msgCompletePayload.put("content", reply);
+                        msgCompletePayload.put("status", status);
+                        msgCompletePayload.putAll(runtimeMetadata(accumulator));
                         if (savedAssistantId != null) {
                             msgCompletePayload.put("assistantMessageId", savedAssistantId);
                         }
@@ -1014,7 +1060,8 @@ public class ChannelMessageRouter {
                 // 广播 done 事件让 observer 前端收尾（HashMap 允许 null 值缺失，Map.of 不允许）
                 Map<String, Object> donePayload = new HashMap<>();
                 donePayload.put("conversationId", conversationId);
-                donePayload.put("status", "completed");
+                donePayload.put("status", terminalStatus);
+                donePayload.putAll(terminalMetadata);
                 if (savedAssistantId != null) {
                     donePayload.put("assistantMessageId", savedAssistantId);
                 }
@@ -1309,6 +1356,84 @@ public class ChannelMessageRouter {
         return s == null || s.isBlank() ? null : s;
     }
 
+    private CopilotTurnMarker beginCopilotTurnIfSelected(
+            Long agentId, String conversationId, ChatOrigin origin) {
+        AgentEntity agent = agentService.getAgent(agentId);
+        if (agent == null || !"copilot".equalsIgnoreCase(agent.getRuntimeType())
+                || origin == null || origin.requesterUserId() == null) {
+            return null;
+        }
+        String executionId = UUID.randomUUID().toString();
+        MessageEntity marker = conversationService.beginCopilotTurn(
+                conversationId, executionId, "copilot", null);
+        if (marker == null || marker.getId() == null) {
+            throw new IllegalStateException("Copilot assistant marker was not persisted");
+        }
+        return new CopilotTurnMarker(executionId, marker.getId());
+    }
+
+    private MessageEntity persistAssistantTurn(String conversationId, String content,
+                                               List<MessageContentPart> parts, String status,
+                                               AgentStreamAccumulator accumulator) {
+        if (accumulator.isCopilotTurn()) {
+            String outcome = accumulator.getRuntimeOutcome();
+            if (!Set.of("completed", "failed", "cancelled").contains(outcome)) {
+                outcome = switch (status) {
+                    case "completed" -> "completed";
+                    case "failed", "error" -> "failed";
+                    default -> "cancelled";
+                };
+                accumulator.ensureCopilotOutcome(outcome);
+            }
+            String finalStatus = switch (outcome) {
+                case "completed" -> "completed";
+                case "failed" -> "failed";
+                default -> "stopped";
+            };
+            if (accumulator.getRuntimeExecutionId().isBlank()
+                    || accumulator.getAssistantMessageId() == null) {
+                throw new IllegalStateException("Copilot assistant marker identity is missing");
+            }
+            return conversationService.finalizeCopilotTurn(
+                    conversationId, accumulator.getAssistantMessageId(),
+                    accumulator.getRuntimeExecutionId(), content, finalStatus, outcome,
+                    accumulator.toMetadataJson(), blankToNull(accumulator.getRuntimeModelName()),
+                    blankToNull(accumulator.getRuntimeProviderId()));
+        }
+        return conversationService.saveMessage(conversationId, "assistant", content, parts,
+                status,
+                accumulator.getPromptTokens(), accumulator.getCompletionTokens(),
+                accumulator.getCacheReadTokens(), accumulator.getCacheWriteTokens(),
+                accumulator.getReasoningTokens(),
+                blankToNull(accumulator.getRuntimeModelName()),
+                blankToNull(accumulator.getRuntimeProviderId()),
+                accumulator.toMetadataJson());
+    }
+
+    private static Map<String, Object> runtimeMetadata(AgentStreamAccumulator accumulator) {
+        Map<String, Object> metadata = new HashMap<>();
+        if (!accumulator.getRuntimeExecutionId().isBlank()) {
+            metadata.put("runtimeExecutionId", accumulator.getRuntimeExecutionId());
+        }
+        if (accumulator.getAssistantMessageId() != null) {
+            metadata.put("assistantMessageId", accumulator.getAssistantMessageId());
+        }
+        if (!accumulator.getRuntimeOutcome().isBlank()) {
+            metadata.put("runtimeOutcome", accumulator.getRuntimeOutcome());
+        }
+        if (!accumulator.getRuntimeProviderId().isBlank()) {
+            metadata.put("runtimeProviderId", accumulator.getRuntimeProviderId());
+        }
+        if (!accumulator.getRuntimeModelName().isBlank()) {
+            metadata.put("runtimeModelName", accumulator.getRuntimeModelName());
+        }
+        return metadata;
+    }
+
+    private record CopilotTurnMarker(String executionId, Long assistantMessageId) {}
+    private record ProcessResult(Long assistantMessageId, String status,
+                                 Map<String, Object> runtimeMetadata) {}
+
     /**
      * Send a progress narration as its own outgoing message. A failed send
      * must not abort the agent run — the final reply still goes out.
@@ -1330,16 +1455,25 @@ public class ChannelMessageRouter {
      * - StreamingChannelAdapter 负责渲染（AI Card / 卡片更新 / 文本累积等）
      * - Router 负责后续的审批检查、消息持久化、事件发布
      */
-    private Long processWithStreaming(ChannelMessage message, StreamingChannelAdapter streamingAdapter,
-                                      String conversationId, Long agentId, String promptText,
-                                      ChannelEntity channelEntity, ChatOrigin chatOrigin) {
+    private ProcessResult processWithStreaming(ChannelMessage message, StreamingChannelAdapter streamingAdapter,
+                                               String conversationId, Long agentId, String promptText,
+                                               ChannelEntity channelEntity, ChatOrigin chatOrigin) {
         String channelType = streamingAdapter.getChannelType();
         log.info("[{}] Streaming processing started: conversationId={}", channelType, conversationId);
+        AgentStreamAccumulator accumulator = newAccumulator();
+        CopilotTurnMarker copilotTurn = beginCopilotTurnIfSelected(agentId, conversationId, chatOrigin);
+        if (copilotTurn != null) {
+            accumulator.associateCopilotTurn(copilotTurn.executionId(), copilotTurn.assistantMessageId());
+        }
 
         try {
             // Step 1: 产生事件流（forward ChatOrigin so tools see channelId）
-            Flux<AgentService.StreamDelta> stream = agentService.chatStructuredStream(
-                    agentId, promptText, conversationId, message.getSenderId(), chatOrigin);
+            Flux<AgentService.StreamDelta> stream = copilotTurn == null
+                    ? agentService.chatStructuredStream(
+                            agentId, promptText, conversationId, message.getSenderId(), chatOrigin)
+                    : agentService.chatStructuredStream(agentId, promptText, conversationId,
+                            message.getSenderId(), null, chatOrigin,
+                            copilotTurn.executionId(), copilotTurn.assistantMessageId());
 
             // Feed every delta through the shared accumulator before the
             // adapter consumes the Flux. The accumulator builds the same
@@ -1350,7 +1484,6 @@ public class ChannelMessageRouter {
             // attribution. Internal bookkeeping events (_usage_final,
             // _routing_decision) are consumed inside the accumulator and
             // never reach subscribers.
-            AgentStreamAccumulator accumulator = newAccumulator();
             Flux<AgentService.StreamDelta> mirroredStream = stream.doOnNext(delta ->
                     accumulator.accept(delta, conversationId));
 
@@ -1368,24 +1501,28 @@ public class ChannelMessageRouter {
                 streamingAdapter.sendApprovalNotice(replyTarget, notice);
                 log.info("[{}] Approval triggered during streaming (NOT saved to DB): tool={}",
                         channelType, newPending.getToolName());
-            } else if (finalContent != null && !finalContent.isBlank()) {
-                boolean isError = errorClassifier.isErrorReply(finalContent);
-                String status = isError ? "error" : "completed";
+                return new ProcessResult(null, "awaiting_approval", runtimeMetadata(accumulator));
+            } else if ((finalContent != null && !finalContent.isBlank()) || copilotTurn != null) {
+                boolean isError = "failed".equals(accumulator.getRuntimeOutcome())
+                        || errorClassifier.isErrorReply(finalContent);
+                String outcome = accumulator.getRuntimeOutcome();
+                if (copilotTurn != null && !Set.of("completed", "failed", "cancelled").contains(outcome)) {
+                    outcome = isError ? "failed" : "completed";
+                    accumulator.ensureCopilotOutcome(outcome);
+                }
+                String status = copilotTurn != null
+                        ? "failed".equals(outcome) ? "failed" : "cancelled".equals(outcome) ? "stopped" : "completed"
+                        : isError ? "error" : "completed";
                 // Persist the full execution record — parts (text/thinking/
                 // tool_call) and metadata (segments/toolCalls/plan/…) — so
                 // the Web console renders IM-routed turns exactly like Web
                 // direct chats. The content column keeps the adapter's final
                 // text (the adapter may have post-processed it).
-                MessageEntity saved = conversationService.saveMessage(
-                        conversationId, "assistant", finalContent,
-                        accumulator.toAssistantParts(), status,
-                        accumulator.getPromptTokens(), accumulator.getCompletionTokens(),
-                        accumulator.getCacheReadTokens(), accumulator.getCacheWriteTokens(),
-                        accumulator.getReasoningTokens(),
-                        blankToNull(accumulator.getRuntimeModelName()),
-                        blankToNull(accumulator.getRuntimeProviderId()),
-                        accumulator.toMetadataJson());
-                if (!isError) {
+                String persistedContent = finalContent == null ? "" : finalContent;
+                MessageEntity saved = persistAssistantTurn(conversationId, persistedContent,
+                        accumulator.toAssistantParts(), status, accumulator);
+                if (!isError && !"cancelled".equals(outcome)
+                        && finalContent != null && !finalContent.isBlank()) {
                     publishConversationCompletedEvent(agentId, conversationId, promptText, finalContent, chatOrigin);
                 }
                 log.info("[{}] Streaming completed: contentLen={}, isError={}",
@@ -1393,7 +1530,7 @@ public class ChannelMessageRouter {
 
                 // 流式回复完成后也触发语音回复
                 String replyTarget = resolveReplyTarget(message);
-                if (replyTarget != null) {
+                if (replyTarget != null && finalContent != null && !finalContent.isBlank()) {
                     maybeGenerateVoiceReply(message, streamingAdapter, replyTarget,
                             conversationId, finalContent, channelEntity);
                 }
@@ -1403,8 +1540,10 @@ public class ChannelMessageRouter {
                     log.debug("[{}] onAgentCompleted hook failed (non-fatal): {}",
                             channelType, hookErr.getMessage());
                 }
-                return saved != null ? saved.getId() : null;
+                return new ProcessResult(saved != null ? saved.getId() : null, status,
+                        runtimeMetadata(accumulator));
             }
+            return new ProcessResult(null, "completed", runtimeMetadata(accumulator));
 
         } catch (Exception e) {
             log.error("[{}] Streaming processing failed: {}", channelType, e.getMessage(), e);
@@ -1412,9 +1551,16 @@ public class ChannelMessageRouter {
             // turn's history does not show a user → user sequence (which some
             // providers reject with 400). sanitizeForLlm filters this row out
             // before the LLM sees it, so it costs nothing at the prompt layer.
+            Long savedId = null;
             try {
-                conversationService.saveMessage(conversationId, "assistant",
-                        "[错误] " + e.getMessage(), null, "error");
+                if (copilotTurn != null) accumulator.ensureCopilotOutcome("failed");
+                MessageEntity saved = copilotTurn == null
+                        ? conversationService.saveMessage(conversationId, "assistant",
+                                "[错误] " + e.getMessage(), null, "error")
+                        : persistAssistantTurn(conversationId,
+                                "[错误] " + (e.getMessage() == null ? "streaming runtime failed" : e.getMessage()),
+                                accumulator.toAssistantParts(), "failed", accumulator);
+                savedId = saved == null ? null : saved.getId();
             } catch (Exception persistErr) {
                 log.warn("[{}] Failed to persist error placeholder: {}",
                         channelType, persistErr.getMessage());
@@ -1425,8 +1571,8 @@ public class ChannelMessageRouter {
             } catch (Exception sendErr) {
                 log.error("[{}] Failed to send streaming error message: {}", channelType, sendErr.getMessage());
             }
+            return new ProcessResult(savedId, "failed", runtimeMetadata(accumulator));
         }
-        return null;
     }
 
 

@@ -105,6 +105,28 @@ You hire coworkers, not chat boxes. Each one has a **Role**, a **Goal**, a **Bac
 ### Agent Runtime: native or DSH (2.2.0+)
 The `AgentRuntimeProvider` contract separates an employee from the engine that runs its turn. The **native runtime** keeps ReAct, Plan-and-Execute, persistent Goals, and Team Runs inside MateClaw. The **DSH runtime** launches the official `dsh --profile sdk` CLI and normalizes its thinking, text, tools, usage, completion, and cancellation events. Managed installation pins `0.2.0-rc.1` (alternative: `0.1.7-rc.2`) with reviewed npm locks and Node.js 22. An opt-in `0.2.1-rc.2` candidate adds SDK compatibility updates; macOS arm64 installation, handshake and short real-model/tool checks passed, while default selection stays unchanged. Upgrades copy runtime homes, check the candidate, and switch a retained generation; rollback restores the previous home/configuration without merging newer sessions. Package and real-model adapter checks passed on macOS arm64; Linux x64 and persisted V3→V4 history migration remain unverified. [Configure DeepSeek Harness →](https://claw.mate.vip/docs/en/deepseek-harness)
 
+### GitHub Copilot runtime (opt-in; acceptance pending)
+An optional provider uses the pinned Java SDK `1.0.14-preview.1` and an
+administrator-supplied CLI executable. It is **disabled by default** and requires
+an explicit GitHub token and exact model ID; ambient CLI login is not used.
+The global-admin **Settings → Copilot** page checks the protocol-3 handshake,
+authentication, and configured model without sending a conversation prompt.
+No CLI version has completed live acceptance yet: deterministic checks ran on
+macOS arm64 with Java 21, but macOS arm64 and Linux x64 provider compatibility
+remain unverified. Keep the provider disabled until the separate live acceptance
+gate is authorized and passes.
+
+Copilot reports cancellation and application-managed context projection only.
+Provider usage/reasoning are unavailable (not zero); approval continuation and
+delegation are unsupported and blocked. SDK process reap can take up to 10
+seconds, so the five-second stop goal is an empirical release gate, not a
+guarantee. Cancellation fences host callback entry and waits for an in-flight
+callback to settle before publishing the final outcome; a callback that ignores
+interruption can delay that outcome. Rollback disables Copilot and reassigns
+employees to their prior runtime; existing conversation history is preserved. See the
+[Copilot runtime validation guide](specs/001-add-copilot-runtime/quickstart.md)
+for prerequisites, deployment settings, and release evidence.
+
 ### Durable long tasks: checkpoint, restart, continue (2.2.0+)
 Persistent Goals turn work that takes hours into bounded, recoverable segments. The database preserves the goal checklist, continuation state, attempts, cooldowns, leases, and user input accepted while the worker is busy. After a single backend instance restarts, the supervisor reconciles the interrupted attempt, reads persisted checkpoints and artifacts, and schedules the next safe segment instead of asking you to repeat the task.
 

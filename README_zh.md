@@ -105,6 +105,23 @@ MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长
 ### Agent Runtime：Native 或 DSH（2.2.0+）
 `AgentRuntimeProvider` contract 将员工与执行引擎分离。**Native Runtime** 在 MateClaw 内运行 ReAct、Plan-and-Execute、Persistent Goal 与 Team Run；**DSH Runtime** 启动官方 `dsh --profile sdk` CLI，统一映射思考、文本、工具、用量、完成与取消事件。受管理安装要求 Node.js 22，使用受审查 npm 锁文件固定 `0.2.0-rc.1`（另选 `0.1.7-rc.2`）。新增可选 `0.2.1-rc.2` 候选，macOS arm64 安装、握手和短模型/工具任务已验证，默认选择保持不变。升级复制 home、检查候选并切换保留的代次；回滚恢复旧 home/配置，不合并升级后的新会话。实际包及真实模型适配器检查已在 macOS arm64 通过；Linux x64 和持久化 V3→V4 历史迁移仍待验证。[配置 DeepSeek Harness →](https://claw.mate.vip/docs/zh/deepseek-harness)
 
+### GitHub Copilot 运行时（可选启用；验收待完成）
+可选 provider 使用固定版本 Java SDK `1.0.14-preview.1` 和管理员提供的 CLI
+可执行文件。该功能**默认停用**，需要显式 GitHub 令牌和精确模型 ID，不使用
+环境中的 CLI 登录态。全局管理员可在**设置 → Copilot**页面检查 protocol-3
+握手、身份验证和配置模型；此检查不会发送对话提示词。目前尚无 CLI 版本通过
+真实服务验收：确定性测试在 macOS arm64 / Java 21 上运行，但 macOS arm64 和
+Linux x64 的真实 provider 兼容性仍未验证。单独的真实验收授权并通过前，请保持
+运行时停用。
+
+Copilot 仅声明取消能力和应用侧上下文投影；provider 用量/推理内容不可用
+（不是零用量），审批后继续和委派执行均不支持且会被阻止。SDK 回收进程最多可
+等待 10 秒，因此 5 秒停止目标是必须实测的发布门槛，不是保证。取消时会封锁
+新的宿主回调入口，并在发布最终状态前等待正在执行的回调结束；不响应中断的回调
+可能延迟最终状态。回滚时停用 Copilot 并将员工重新分配给原运行时，已有对话历史会保留。
+详细前置条件、部署
+配置和发布证据要求见 [Copilot 运行时验证指南](specs/001-add-copilot-runtime/quickstart.md)。
+
 ### 持久长任务：检查点、重启、继续（2.2.0+）
 Persistent Goal 把需要数小时的工作拆成有界、可恢复的执行段。数据库会保存目标清单、continuation 状态、attempt、冷却、lease，以及员工忙碌期间已经接收的用户输入。单后端实例重启后，supervisor 会先核对被中断的 attempt，读取持久检查点和已有产物，再调度下一段安全工作，不要求用户重新描述任务。
 

@@ -1,6 +1,8 @@
 package vip.mate.agent;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,13 +13,20 @@ import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 import vip.mate.agent.context.ChatOrigin;
 import vip.mate.agent.context.ChatOriginHolder;
+import vip.mate.agent.context.TokenEstimator;
 import vip.mate.agent.event.AgentLifecycleEvent;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.agent.progress.ProgressLedgerService;
 import vip.mate.agent.repository.AgentMapper;
+import vip.mate.agent.runtime.RuntimeConversationHistory;
+import vip.mate.agent.runtime.contract.AgentRuntimeConnection;
+import vip.mate.agent.runtime.contract.RuntimeTurnContext;
+import vip.mate.agent.runtime.copilot.CopilotRuntimeConfigService;
 import vip.mate.exception.MateClawException;
 import vip.mate.llm.chatmodel.ThinkingLevelHolder;
 import vip.mate.llm.event.ModelConfigChangedEvent;
+import vip.mate.llm.model.ModelConfigEntity;
+import vip.mate.llm.probe.ModelContextWindowResolver;
 import vip.mate.memory.MemoryProperties;
 import vip.mate.memory.lifecycle.MemoryLifecycleMediator;
 import vip.mate.memory.lifecycle.TurnContext;
@@ -27,12 +36,17 @@ import vip.mate.workspace.conversation.model.ConversationEntity;
 import vip.mate.workspace.conversation.repository.ConversationMapper;
 
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
-import java.util.function.Supplier;
+import java.util.UUID;
+import java.io.IOException;
 
 /**
  * Agent 业务服务
@@ -46,6 +60,8 @@ import java.util.function.Supplier;
 @Service
 @RequiredArgsConstructor
 public class AgentService {
+    private static final ObjectMapper RUNTIME_CONFIG_MAPPER = new ObjectMapper();
+    private static final int DEFAULT_COPILOT_CONTEXT_TOKENS = 128_000;
 
     private final AgentMapper agentMapper;
     private final AgentGraphBuilder agentGraphBuilder;
@@ -91,6 +107,15 @@ public class AgentService {
 
     @Autowired
     private vip.mate.agent.runtime.dsh.DshConversationHistory dshConversationHistory;
+
+    @Autowired(required = false)
+    private CopilotRuntimeConfigService copilotRuntimeConfigService;
+
+    @Autowired(required = false)
+    private RuntimeConversationHistory runtimeConversationHistory;
+
+    @Autowired(required = false)
+    private ModelContextWindowResolver modelContextWindowResolver;
 
     @Autowired(required = false)
     private vip.mate.goal.service.GoalApprovalReplayStream goalApprovalReplay;
@@ -154,11 +179,14 @@ public class AgentService {
         } else {
             agent.setRuntimeType(agent.getRuntimeType().trim().toLowerCase(Locale.ROOT));
         }
-        if (!"native".equals(agent.getRuntimeType()) && !"dsh".equals(agent.getRuntimeType())) {
+        if (!"native".equals(agent.getRuntimeType())
+                && !"dsh".equals(agent.getRuntimeType())
+                && !"copilot".equals(agent.getRuntimeType())) {
             throw new MateClawException("err.agent.runtime_unsupported", 400,
                     "Unsupported runtime provider: " + agent.getRuntimeType());
         }
         validateDshConfiguration(agent);
+        validateCopilotConfiguration(agent);
         requireUniqueName(agent, null);
         agentMapper.insert(agent);
         publishLifecycle(agent, "spawned");
@@ -170,6 +198,19 @@ public class AgentService {
         // intent rather than every metadata edit. Reading the prior row
         // is cheap and gives us a clean diff source.
         AgentEntity prior = agentMapper.selectById(agent.getId());
+        if (!StringUtils.hasText(agent.getRuntimeType())) {
+            agent.setRuntimeType(prior != null && StringUtils.hasText(prior.getRuntimeType())
+                    ? prior.getRuntimeType()
+                    : "native");
+        } else {
+            agent.setRuntimeType(agent.getRuntimeType().trim().toLowerCase(Locale.ROOT));
+        }
+        if (!"native".equals(agent.getRuntimeType())
+                && !"dsh".equals(agent.getRuntimeType())
+                && !"copilot".equals(agent.getRuntimeType())) {
+            throw new MateClawException("err.agent.runtime_unsupported", 400,
+                    "Unsupported runtime provider: " + agent.getRuntimeType());
+        }
         // Only re-validate uniqueness when the name actually changes —
         // a pure metadata edit (icon, prompt, ...) shouldn't pay the
         // SELECT cost or risk a false positive against the row itself.
@@ -183,9 +224,8 @@ public class AgentService {
             }
             requireUniqueName(agent, agent.getId());
         }
-        if ("dsh".equalsIgnoreCase(agent.getRuntimeType())) {
-            validateDshConfiguration(agent);
-        }
+        validateDshConfiguration(agent);
+        validateCopilotConfiguration(agent);
         agentMapper.updateById(agent);
         agentInstances.remove(agent.getId());
         if (prior != null && prior.getEnabled() != null
@@ -334,6 +374,14 @@ public class AgentService {
             return collectChatResult(chatStructuredStream(agentId, message, conversationId,
                     "", null, origin != null ? origin : ChatOrigin.EMPTY)).content();
         }
+        if (isCopilotAgent(agentId)) {
+            ChatResult result = collectChatResult(chatStructuredStream(agentId, message, conversationId,
+                    "", null, origin != null ? origin : ChatOrigin.EMPTY));
+            if (!"completed".equals(result.runtimeOutcome())) {
+                throw copilotOutcomeFailure(result.runtimeOutcome());
+            }
+            return result.content();
+        }
         trackMemoryRecalls(agentId, message, origin);
         BaseAgent agent = getOrBuildAgentForConversation(agentId, conversationId);
         ChatOrigin previousOrigin = ChatOriginHolder.get();
@@ -363,7 +411,13 @@ public class AgentService {
     }
 
     public ChatResult chatWithUsage(Long agentId, String message, String conversationId, ChatOrigin origin) {
-        return collectChatResult(chatStructuredStream(agentId, message, conversationId, "", null, origin));
+        return chatWithUsage(agentId, message, conversationId, origin, null, null);
+    }
+
+    public ChatResult chatWithUsage(Long agentId, String message, String conversationId, ChatOrigin origin,
+                                    String runtimeExecutionId, Long assistantMessageId) {
+        return collectChatResult(chatStructuredStream(agentId, message, conversationId, "", null, origin,
+                runtimeExecutionId, assistantMessageId));
     }
 
     public Flux<String> chatStream(Long agentId, String message, String conversationId) {
@@ -371,6 +425,37 @@ public class AgentService {
     }
 
     public Flux<String> chatStream(Long agentId, String message, String conversationId, ChatOrigin origin) {
+        if (isCopilotAgent(agentId)) {
+            AtomicReference<String> outcome = new AtomicReference<>();
+            Flux<String> content = chatStructuredStream(
+                            agentId, message, conversationId, "", null,
+                            origin != null ? origin : ChatOrigin.EMPTY)
+                    .handle((delta, sink) -> {
+                        if (delta.content() != null) {
+                            sink.next(delta.content());
+                            return;
+                        }
+                        if (delta.eventType() == null) return;
+                        Map<String, Object> data =
+                                delta.eventData() == null ? Map.of() : delta.eventData();
+                        if ("done".equals(delta.eventType())) {
+                            Object value = data.get("runtimeOutcome");
+                            outcome.set(value == null ? null : value.toString());
+                            if (!"completed".equals(outcome.get())) {
+                                sink.error(copilotOutcomeFailure(outcome.get()));
+                            }
+                        } else if ("error".equals(delta.eventType())) {
+                            outcome.set("failed");
+                            sink.error(copilotOutcomeFailure(outcome.get()));
+                        } else if ("cancelled".equals(delta.eventType())) {
+                            outcome.set("cancelled");
+                            sink.error(copilotOutcomeFailure(outcome.get()));
+                        }
+                    });
+            return content.concatWith(Flux.defer(() -> "completed".equals(outcome.get())
+                    ? Flux.empty()
+                    : Flux.error(copilotOutcomeFailure(outcome.get()))));
+        }
         clearAutoRecordedForNewTurn(conversationId);
         if (isDshAgent(agentId)) {
             return chatStructuredStream(agentId, message, conversationId, "", null,
@@ -410,6 +495,14 @@ public class AgentService {
     public Flux<StreamDelta> chatStructuredStream(Long agentId, String message, String conversationId,
                                                    String requesterId, String thinkingLevel,
                                                    ChatOrigin origin) {
+        return chatStructuredStream(agentId, message, conversationId, requesterId, thinkingLevel, origin,
+                null, null);
+    }
+
+    public Flux<StreamDelta> chatStructuredStream(Long agentId, String message, String conversationId,
+                                                   String requesterId, String thinkingLevel,
+                                                   ChatOrigin origin, String runtimeExecutionId,
+                                                   Long assistantMessageId) {
         clearAutoRecordedForNewTurn(conversationId);
         trackMemoryRecalls(agentId, message, origin);
         if (isDshAgent(agentId)) {
@@ -424,6 +517,16 @@ public class AgentService {
                                             convId, message, msg, origin))),
                             connection -> connection.close()),
                     StreamDelta::content);
+        }
+        if (isCopilotAgent(agentId)) {
+            AgentEntity copilotAgent = getAgent(agentId);
+            String capturedThinking = thinkingLevel;
+            if (capturedThinking == null || capturedThinking.isBlank()) {
+                capturedThinking = copilotAgent.getDefaultThinkingLevel();
+            }
+            return copilotStructuredStream(
+                    copilotAgent, message, conversationId, origin, capturedThinking,
+                    runtimeExecutionId, assistantMessageId);
         }
         BaseAgent agent = getOrBuildAgentForConversation(agentId, conversationId);
 
@@ -450,6 +553,7 @@ public class AgentService {
     }
 
     public String execute(Long agentId, String goal, String conversationId, ChatOrigin origin) {
+        rejectCopilotNativeOperation(agentId, "planning and goal execution");
         clearAutoRecordedForNewTurn(conversationId);
         trackMemoryRecalls(agentId, goal, origin);
         BaseAgent agent = getOrBuildAgentForConversation(agentId, conversationId);
@@ -479,6 +583,7 @@ public class AgentService {
 
     public String chatWithReplay(Long agentId, String userMessage, String conversationId,
                                   String toolCallPayload, ChatOrigin origin) {
+        rejectCopilotNativeOperation(agentId, "approval replay");
         trackMemoryRecalls(agentId, userMessage, origin);
         BaseAgent agent = getOrBuildAgentForConversation(agentId, conversationId);
         ChatOrigin previousOrigin = ChatOriginHolder.get();
@@ -528,6 +633,7 @@ public class AgentService {
     public Flux<StreamDelta> chatWithReplayStream(Long agentId, String userMessage, String conversationId,
                                                    String toolCallPayload, String requesterId,
                                                    ChatOrigin origin) {
+        rejectCopilotNativeOperation(agentId, "approval replay");
         trackMemoryRecalls(agentId, userMessage, origin);
         BaseAgent agent = getOrBuildAgentForConversation(agentId, conversationId);
         ChatOrigin captured = origin != null ? origin : ChatOrigin.EMPTY;
@@ -775,6 +881,255 @@ public class AgentService {
         return "dsh".equalsIgnoreCase(entity.getRuntimeType());
     }
 
+    private boolean isCopilotAgent(Long agentId) {
+        return agentId != null && "copilot".equalsIgnoreCase(getAgent(agentId).getRuntimeType());
+    }
+
+    private void rejectCopilotNativeOperation(Long agentId, String operation) {
+        if (isCopilotAgent(agentId)) {
+            throw new MateClawException("copilot.operation_unsupported", 400,
+                    operation + " is not supported by the Copilot runtime");
+        }
+    }
+
+    private Flux<StreamDelta> copilotStructuredStream(
+            AgentEntity employee,
+            String message,
+            String conversationId,
+            ChatOrigin origin,
+            String thinkingLevel,
+            String requestedExecutionId,
+            Long assistantMessageId) {
+        if (runtimeCoordinator == null) {
+            throw new MateClawException("err.agent.runtime_unavailable", 503,
+                    "Copilot runtime provider is unavailable");
+        }
+        if (!Boolean.TRUE.equals(employee.getEnabled())) {
+            throw new MateClawException("err.agent.disabled", "Agent 已禁用: " + employee.getName());
+        }
+        if (runtimeConversationHistory == null) {
+            throw new MateClawException("copilot.history_unavailable", 503,
+                    "Copilot conversation history is unavailable");
+        }
+
+        ConversationEntity conversation = findCopilotConversation(conversationId);
+        if (conversation != null && "team_worker".equalsIgnoreCase(conversation.getConversationKind())) {
+            throw new MateClawException("copilot.operation_unsupported", 400,
+                    "Team Run is not supported by the Copilot runtime");
+        }
+        requireCopilotConfiguration();
+        String modelName = resolveCopilotModelName(employee, conversation);
+        Path workspaceRoot = resolveCopilotWorkspaceRoot(employee, origin);
+        ChatOrigin trustedOrigin = validateCopilotOrigin(
+                employee, conversationId, origin, workspaceRoot);
+        String systemPrompt = employee.getSystemPrompt() == null ? "" : employee.getSystemPrompt();
+        int contextLimit = copilotContextLimit(modelName);
+        assertCopilotContextFits(systemPrompt, message, contextLimit);
+        String executionId = requestedExecutionId == null || requestedExecutionId.isBlank()
+                ? UUID.randomUUID().toString()
+                : requestedExecutionId;
+
+        return withLifecycleFlux(
+                employee.getId(),
+                message,
+                conversationId,
+                (currentInput, convId) -> {
+                    assertCopilotContextFits(systemPrompt, currentInput, contextLimit);
+                    String enriched = runtimeConversationHistory.enrich(
+                            convId, message, currentInput, trustedOrigin);
+                    assertCopilotContextFits(systemPrompt, enriched, contextLimit);
+                    AgentGraphBuilder.CopilotToolExecutionContext toolExecutionContext =
+                            agentGraphBuilder.createCopilotToolExecutionContext(employee);
+                    RuntimeTurnContext turnContext = new RuntimeTurnContext(
+                            trustedOrigin, workspaceRoot, systemPrompt,
+                            toolExecutionContext.toolSet(), toolExecutionContext.executor());
+                    return Flux.using(
+                            () -> runtimeCoordinator.start(
+                                    employee,
+                                    convId,
+                                    executionId,
+                                    modelName,
+                                    workspaceRoot,
+                                    workspaceRoot,
+                                    turnContext),
+                            connection -> vip.mate.agent.runtime.RuntimeEventStreamAdapter.adapt(
+                                            connection.prompt(enriched))
+                                    .map(delta -> attachCopilotTurnIdentity(
+                                            delta, executionId, assistantMessageId)),
+                            AgentRuntimeConnection::close)
+                            .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic());
+                },
+                StreamDelta::content,
+                trustedOrigin,
+                thinkingLevel);
+    }
+
+    private static StreamDelta attachCopilotTurnIdentity(
+            StreamDelta delta, String executionId, Long assistantMessageId) {
+        if (!delta.isEvent()) return delta;
+        Map<String, Object> data = new LinkedHashMap<>(
+                delta.eventData() == null ? Map.of() : delta.eventData());
+        data.put("runtimeExecutionId", executionId);
+        if (assistantMessageId != null) data.put("assistantMessageId", assistantMessageId);
+        return StreamDelta.event(delta.eventType(), data);
+    }
+
+    private CopilotRuntimeConfigService.Snapshot requireCopilotConfiguration() {
+        if (copilotRuntimeConfigService == null) {
+            throw new MateClawException("err.agent.runtime_unavailable", 503,
+                    "Copilot runtime configuration is unavailable");
+        }
+        CopilotRuntimeConfigService.Snapshot configuration = copilotRuntimeConfigService.resolve();
+        if (!configuration.enabled()) {
+            throw new MateClawException("copilot.disabled", 503, "Copilot runtime is disabled");
+        }
+        if (!configuration.valid()) {
+            throw new MateClawException("copilot.config_invalid", 503,
+                    configuration.validationError());
+        }
+        return configuration;
+    }
+
+    /**
+     * Resolve the model for Copilot without requiring a native model-config row.
+     * A null conversation id is used by provider-aware capability snapshots.
+     */
+    public String resolveCopilotModelName(AgentEntity employee, String conversationId) {
+        return resolveCopilotModelName(employee, findCopilotConversation(conversationId));
+    }
+
+    private String resolveCopilotModelName(AgentEntity employee, ConversationEntity conversation) {
+        String conversationModel = pinnedCopilotModel(conversation);
+        if (conversationModel != null) return conversationModel;
+
+        String override = copilotModelOverride(employee);
+        if (override != null) return override;
+        if (StringUtils.hasText(employee.getModelName())) return employee.getModelName().trim();
+
+        if (copilotRuntimeConfigService == null) {
+            throw new MateClawException("err.agent.runtime_unavailable", 503,
+                    "Copilot runtime configuration is unavailable");
+        }
+        String defaultModel = copilotRuntimeConfigService.resolve().modelName();
+        if (!StringUtils.hasText(defaultModel)) {
+            throw new MateClawException("copilot.model_required", 400,
+                    "A Copilot model must be configured");
+        }
+        return defaultModel.trim();
+    }
+
+    private ConversationEntity findCopilotConversation(String conversationId) {
+        if (!StringUtils.hasText(conversationId)) return null;
+        if (conversationMapper == null) {
+            throw new MateClawException("copilot.model_pin_invalid", 400,
+                    "Conversation model selection is unavailable");
+        }
+        return conversationMapper.selectOne(
+                new LambdaQueryWrapper<ConversationEntity>()
+                        .eq(ConversationEntity::getConversationId, conversationId));
+    }
+
+    private String pinnedCopilotModel(ConversationEntity conversation) {
+        if (conversation == null) return null;
+        String provider = blankToNull(conversation.getModelProvider());
+        String model = blankToNull(conversation.getModelName());
+        if (provider == null && model == null) return null;
+        if (provider == null || model == null || !"copilot".equalsIgnoreCase(provider)) {
+            throw new MateClawException("copilot.model_pin_invalid", 400,
+                    "Copilot conversations require a complete Copilot model selection");
+        }
+        return model.trim();
+    }
+
+    private static String copilotModelOverride(AgentEntity employee) {
+        if (employee == null) {
+            throw new MateClawException("err.agent.not_found", "Agent is required");
+        }
+        String configuration = employee.getRuntimeConfig();
+        if (configuration == null || configuration.isBlank()) return null;
+        try {
+            JsonNode root = RUNTIME_CONFIG_MAPPER.readTree(configuration);
+            if (root == null || !root.isObject()) throw invalidCopilotConfiguration();
+            if (root.isEmpty()) return null;
+            if (root.size() != 1 || !root.has("model")
+                    || !root.path("model").isTextual()
+                    || root.path("model").asText().isBlank()) {
+                throw invalidCopilotConfiguration();
+            }
+            return root.path("model").asText().trim();
+        } catch (IOException error) {
+            throw invalidCopilotConfiguration();
+        }
+    }
+
+    private Path resolveCopilotWorkspaceRoot(AgentEntity employee, ChatOrigin origin) {
+        String configuredRoot = blankToNull(employee.getWorkspaceBasePath());
+        String originRoot = origin == null ? null : blankToNull(origin.workspaceBasePath());
+        String source = configuredRoot != null ? configuredRoot : originRoot;
+        if (source == null) {
+            throw new MateClawException("copilot.context_invalid", 400,
+                    "Copilot workspace root is required");
+        }
+        try {
+            Path root = Path.of(source).toRealPath();
+            if (!Files.isDirectory(root)) {
+                throw new MateClawException("copilot.context_invalid", 400,
+                        "Copilot workspace root must be a directory");
+            }
+            if (originRoot != null && !root.equals(Path.of(originRoot).toRealPath())) {
+                throw new MateClawException("copilot.context_invalid", 403,
+                        "Copilot workspace root does not match the authorized origin");
+            }
+            return root;
+        } catch (IOException | InvalidPathException error) {
+            throw new MateClawException("copilot.context_invalid", 400,
+                    "Copilot workspace root must exist and be accessible");
+        }
+    }
+
+    private static ChatOrigin validateCopilotOrigin(
+            AgentEntity employee, String conversationId, ChatOrigin origin, Path workspaceRoot) {
+        if (origin == null || origin.requesterUserId() == null) {
+            throw new MateClawException("copilot.identity_required", 403,
+                    "Copilot requires an authenticated account requester");
+        }
+        if (employee.getWorkspaceId() == null
+                || (origin.workspaceId() != null
+                        && !employee.getWorkspaceId().equals(origin.workspaceId()))) {
+            throw new MateClawException("copilot.context_invalid", 403,
+                    "Copilot workspace does not match the employee");
+        }
+        if ((origin.agentId() != null && !employee.getId().equals(origin.agentId()))
+                || (origin.conversationId() != null
+                        && !origin.conversationId().equals(conversationId))) {
+            throw new MateClawException("copilot.context_invalid", 403,
+                    "Copilot turn identity does not match the request");
+        }
+        return origin.withAgent(employee.getId())
+                .withConversationId(conversationId)
+                .withWorkspace(employee.getWorkspaceId(), workspaceRoot.toString());
+    }
+
+    private int copilotContextLimit(String modelName) {
+        if (modelContextWindowResolver != null) {
+            ModelConfigEntity model = new ModelConfigEntity();
+            model.setModelName(modelName);
+            Integer resolved = modelContextWindowResolver.resolveWithoutProbing(null, model);
+            if (resolved != null && resolved > 0) return resolved;
+        }
+        return DEFAULT_COPILOT_CONTEXT_TOKENS;
+    }
+
+    private static void assertCopilotContextFits(
+            String systemPrompt, String currentInput, int contextLimit) {
+        long estimatedTokens = (long) TokenEstimator.estimateTokens(systemPrompt)
+                + TokenEstimator.estimateTokens(currentInput);
+        if (estimatedTokens > contextLimit) {
+            throw new MateClawException("copilot.input_too_large", 413,
+                    "Copilot instructions and current input exceed the model context limit");
+        }
+    }
+
     private void trackMemoryRecalls(Long agentId, String message, ChatOrigin origin) {
         String ownerKey = memoryProperties.isLifecycleMediatorEnabled()
                 ? memoryOwnerResolver.resolve(origin != null ? origin : ChatOrigin.EMPTY)
@@ -793,6 +1148,23 @@ public class AgentService {
         } catch (IllegalArgumentException error) {
             throw new MateClawException("err.agent.runtime_invalid", 400, error.getMessage());
         }
+    }
+
+    private void validateCopilotConfiguration(AgentEntity agent) {
+        if ("copilot".equalsIgnoreCase(agent.getRuntimeType())) copilotModelOverride(agent);
+    }
+
+    private static MateClawException invalidCopilotConfiguration() {
+        return new MateClawException("copilot.config_invalid", 400,
+                "Copilot employee configuration accepts only a nonblank model override");
+    }
+
+    private static MateClawException copilotOutcomeFailure(String runtimeOutcome) {
+        boolean cancelled = "cancelled".equals(runtimeOutcome);
+        return new MateClawException(
+                cancelled ? "copilot.turn_cancelled" : "copilot.turn_failed",
+                cancelled ? 409 : 502,
+                "Copilot runtime did not complete the turn");
     }
 
     private Path dshWorkingDirectory(AgentEntity agent) {
@@ -980,15 +1352,25 @@ public class AgentService {
      * post-approval replays).
      */
     public record ChatResult(String content, int promptTokens, int completionTokens,
-                              String runtimeModel, String runtimeProvider, String finishReason) {
+                              String runtimeModel, String runtimeProvider, String finishReason,
+                              String runtimeExecutionId, Long assistantMessageId,
+                              String runtimeOutcome, String errorMessage) {
+
+        public ChatResult(String content, int promptTokens, int completionTokens,
+                          String runtimeModel, String runtimeProvider, String finishReason) {
+            this(content, promptTokens, completionTokens, runtimeModel, runtimeProvider, finishReason,
+                    null, null, null, null);
+        }
 
         public ChatResult(String content, int promptTokens, int completionTokens,
                           String runtimeModel, String runtimeProvider) {
-            this(content, promptTokens, completionTokens, runtimeModel, runtimeProvider, null);
+            this(content, promptTokens, completionTokens, runtimeModel, runtimeProvider, null,
+                    null, null, null, null);
         }
 
         public static ChatResult contentOnly(String content) {
-            return new ChatResult(content != null ? content : "", 0, 0, null, null, null);
+            return new ChatResult(content != null ? content : "", 0, 0, null, null, null,
+                    null, null, null, null);
         }
     }
 }

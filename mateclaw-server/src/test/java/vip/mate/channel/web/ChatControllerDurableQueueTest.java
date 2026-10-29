@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.security.core.Authentication;
 import vip.mate.agent.AgentService;
+import vip.mate.agent.model.AgentEntity;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.channel.web.ConversationInputQueueStore.QueuedInput;
 import vip.mate.memory.event.ConversationCompletionPublisher;
@@ -68,6 +69,7 @@ class ChatControllerDurableQueueTest {
     @Test
     void queuedStreamCarriesThePersistedAccountInsteadOfThePreviousTurnDisplayName() {
         AgentService agents = mock(AgentService.class);
+        when(agents.getAgent(2L)).thenReturn(nativeAgent());
         ConversationService conversations = mock(ConversationService.class);
         ChatStreamTracker streams = mock(ChatStreamTracker.class);
         ConversationInputQueueStore queue = mock(ConversationInputQueueStore.class);
@@ -103,6 +105,7 @@ class ChatControllerDurableQueueTest {
     @Test
     void oldQueuedInputWithManagedHistoryDoesNotStartAnUnselectedTurn() {
         AgentService agents = mock(AgentService.class);
+        when(agents.getAgent(2L)).thenReturn(nativeAgent());
         ConversationService conversations = mock(ConversationService.class);
         ConversationInputQueueStore queue = mock(ConversationInputQueueStore.class);
         ChatStreamTracker streams = mock(ChatStreamTracker.class);
@@ -135,12 +138,14 @@ class ChatControllerDurableQueueTest {
         org.mockito.Mockito.verify(queue).bindMessage(eq(92L), any(), eq(101L), any());
         org.mockito.Mockito.verify(queue).consume(eq(92L), any(), any());
         assertThat(emitter.events.toString()).contains("queued_input_skipped", "old queued text");
-        org.mockito.Mockito.verifyNoInteractions(agents);
+        org.mockito.Mockito.verify(agents).getAgent(2L);
+        org.mockito.Mockito.verifyNoMoreInteractions(agents);
     }
 
     @Test
     void explicitlyUnselectedQueuedInputDoesNotJoinGoalThatAppearedWhileWaiting() {
         AgentService agents = mock(AgentService.class);
+        when(agents.getAgent(2L)).thenReturn(nativeAgent());
         ConversationService conversations = mock(ConversationService.class);
         ConversationInputQueueStore queue = mock(ConversationInputQueueStore.class);
         ChatStreamTracker streams = mock(ChatStreamTracker.class);
@@ -174,12 +179,14 @@ class ChatControllerDurableQueueTest {
         org.mockito.Mockito.verify(conversations).saveMessage("conv", "user", "unselected queued text", List.of(), "queued");
         org.mockito.Mockito.verify(queue).consume(eq(94L), any(), any());
         assertThat(emitter.events.toString()).contains("queued_input_skipped", "unselected queued text");
-        org.mockito.Mockito.verifyNoInteractions(agents);
+        org.mockito.Mockito.verify(agents).getAgent(2L);
+        org.mockito.Mockito.verifyNoMoreInteractions(agents);
     }
 
     @Test
     void skippingAnOldRowStillRunsTheNextQueuedMessage() {
         AgentService agents = mock(AgentService.class);
+        when(agents.getAgent(2L)).thenReturn(nativeAgent());
         ConversationService conversations = mock(ConversationService.class);
         ConversationInputQueueStore queue = mock(ConversationInputQueueStore.class);
         var old = new QueuedInput(92L, "conv", 2L, "alice", "old",
@@ -220,6 +227,12 @@ class ChatControllerDurableQueueTest {
         org.mockito.Mockito.verify(runs, org.mockito.Mockito.never()).captureSelectedGoal(any());
         org.mockito.Mockito.verify(queue).consume(eq(92L), any(), any());
         org.mockito.Mockito.verify(queue).consume(eq(93L), any(), any());
+    }
+
+    private static AgentEntity nativeAgent() {
+        AgentEntity agent = new AgentEntity();
+        agent.setRuntimeType("native");
+        return agent;
     }
 
     private static final class RecordingEmitter extends org.springframework.web.servlet.mvc.method.annotation.SseEmitter {

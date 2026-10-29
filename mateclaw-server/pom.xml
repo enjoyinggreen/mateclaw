@@ -107,6 +107,12 @@
             <artifactId>mcp</artifactId>
         </dependency>
 
+        <!-- GitHub Copilot Java SDK; version is managed by the reactor root. -->
+        <dependency>
+            <groupId>com.github</groupId>
+            <artifactId>copilot-sdk-java</artifactId>
+        </dependency>
+
         <!-- ===== H2 embedded database (development) ===== -->
         <dependency>
             <groupId>com.h2database</groupId>

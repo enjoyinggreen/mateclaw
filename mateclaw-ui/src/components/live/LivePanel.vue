@@ -150,6 +150,9 @@
         <!-- Meta: just the time + orphan hint (id moved to detail) -->
         <div class="agent-meta-row">
           <span class="meta-time">{{ formatAge(run.ageMs) }}</span>
+          <span v-if="run.runtimeProvider" class="meta-pill meta-pill-provider">
+            {{ run.runtimeProvider }}
+          </span>
           <span v-if="run.orphan && !run.stuckReason" class="meta-pill meta-pill-orphan" :title="t('live.orphanHint')">
             {{ t('live.orphan') }}
           </span>
@@ -1234,6 +1237,10 @@ html.dark .agent-card.is-stuck .tool-chip {
   background: hsla(265, 50%, 60%, 0.1);
   color: hsl(265, 45%, 50%);
   border-color: hsla(265, 50%, 60%, 0.2);
+}
+
+.meta-pill-provider {
+  color: var(--mc-text-secondary);
 }
 
 .agent-bar {

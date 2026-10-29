@@ -32,12 +32,14 @@ export interface LoginResponse {
 }
 
 // ==================== Agent ====================
+export type AgentRuntimeType = 'native' | 'dsh' | 'copilot'
+
 export interface Agent {
   id: string | number
   name: string
   description?: string
   agentType: 'react' | 'plan_execute'
-  runtimeType?: 'native' | 'dsh' | string
+  runtimeType?: AgentRuntimeType
   runtimeConfig?: string | null
   systemPrompt?: string
   modelName?: string
@@ -127,6 +129,13 @@ export interface Message {
   metadata?: MessageMetadata
   // 结构化错误信息（status === 'failed' 时可用）
   errorInfo?: ChatErrorInfo
+}
+
+export interface UsageAvailability {
+  promptTokens: boolean
+  completionTokens: boolean
+  contextTokens: boolean
+  contextWindow: boolean
 }
 
 export interface ChatAttachment {
@@ -314,6 +323,17 @@ export interface MessageMetadata {
   /** Team orchestration ids remain strings to preserve Snowflake precision. */
   runId?: string
   taskId?: string
+  runtimeExecutionId?: string
+  assistantMessageId?: number | string
+  runtimeOutcome?: 'completed' | 'failed' | 'cancelled'
+  runtimeProviderId?: string
+  runtimeModelName?: string
+  runtimeErrorMessage?: string
+  usageAvailability?: UsageAvailability
+  promptTokens?: number
+  completionTokens?: number
+  contextTokens?: number
+  contextWindow?: number
   originMessageId?: string
   teamId?: string
   leadConversationId?: string

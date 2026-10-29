@@ -268,6 +268,9 @@ public class ChatStreamTracker {
         /** Bound agent identifier; null while not yet resolved. */
         volatile Long agentId;
 
+        /** Runtime provider captured when this run starts; unaffected by later agent edits. */
+        volatile String runtimeProvider;
+
         /** Username that owns this run; null for system-driven runs. */
         volatile String username;
 
@@ -2319,10 +2322,16 @@ public class ChatStreamTracker {
      * only metadata.
      */
     public void bindRunMeta(String conversationId, Long agentId, String username) {
+        bindRunMeta(conversationId, agentId, username, null);
+    }
+
+    public void bindRunMeta(
+            String conversationId, Long agentId, String username, String runtimeProvider) {
         RunState s = runs.get(conversationId);
         if (s == null) return;
         if (agentId != null) s.agentId = agentId;
         if (username != null) s.username = username;
+        if (runtimeProvider != null) s.runtimeProvider = runtimeProvider;
     }
 
     /**
@@ -2333,6 +2342,7 @@ public class ChatStreamTracker {
     public record RunSnapshot(
             String conversationId,
             Long agentId,
+            String runtimeProvider,
             String username,
             String currentPhase,
             String runningToolName,
@@ -2367,6 +2377,7 @@ public class ChatStreamTracker {
             out.add(new RunSnapshot(
                     s.conversationId,
                     s.agentId,
+                    s.runtimeProvider,
                     s.username,
                     s.currentPhase,
                     s.runningToolName,

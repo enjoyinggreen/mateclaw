@@ -9,10 +9,22 @@ const props = defineProps<{
 
 const { t } = useI18n()
 
-/** Compact token count, e.g. 31200 → "~31.2K". */
-function fmtTokens(n: number): string {
+const hasProviderMeasurement = computed(() => {
+  const u = props.usage
+  return u?.runtimeProviderId === 'copilot'
+    && u.usageAvailability?.contextTokens === true
+    && u.usageAvailability.contextWindow === true
+    && u.windowTokens > 0
+})
+const providerContextUnavailable = computed(() =>
+  props.usage?.runtimeProviderId === 'copilot' && !hasProviderMeasurement.value,
+)
+
+/** Compact token count, e.g. 31200 → "~31.2K" when estimated. */
+function fmtTokens(n: number, estimated = true): string {
   if (n <= 0) return '0'
-  return n >= 1000 ? '~' + (n / 1000).toFixed(1) + 'K' : '~' + String(n)
+  const formatted = n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n)
+  return estimated ? '~' + formatted : formatted
 }
 
 const percent = computed(() => {
@@ -55,15 +67,20 @@ const barSegments = computed(() => {
 </script>
 
 <template>
+  <span v-if="providerContextUnavailable" class="ctx-usage-unavailable">
+    {{ $t('chat.usageDetail.unavailable') }}
+  </span>
   <el-popover
-    v-if="usage && usage.windowTokens > 0"
+    v-else-if="usage && usage.windowTokens > 0"
     placement="top-end"
     trigger="click"
     :width="300"
     popper-class="mc-ctx-popover"
   >
     <template #reference>
-      <button class="ctx-chip" :class="'ctx-chip--' + level" type="button" :title="$t('chat.contextUsage.chipTooltip')">
+      <button class="ctx-chip" :class="'ctx-chip--' + level" type="button" :title="$t(
+        hasProviderMeasurement ? 'chat.contextUsage.providerReportedTooltip' : 'chat.contextUsage.chipTooltip',
+      )">
         <span class="ctx-chip__bar">
           <span class="ctx-chip__fill" :style="{ width: Math.min(100, percent) + '%' }" />
         </span>
@@ -74,7 +91,8 @@ const barSegments = computed(() => {
     <div class="ctx-panel">
       <div class="ctx-panel__head">
         <span class="ctx-panel__totals">
-          {{ fmtTokens(usage.usedTokens) }} / {{ fmtTokens(usage.windowTokens) }}
+          {{ fmtTokens(usage.usedTokens, !hasProviderMeasurement) }} /
+          {{ fmtTokens(usage.windowTokens, !hasProviderMeasurement) }}
         </span>
         <span class="ctx-panel__pct" :class="'ctx-panel__pct--' + level">{{ percent }}%</span>
         <span class="ctx-panel__title">{{ $t('chat.contextUsage.title') }}</span>
@@ -89,7 +107,7 @@ const barSegments = computed(() => {
         />
       </div>
 
-      <div class="ctx-panel__rows">
+      <div v-if="!hasProviderMeasurement" class="ctx-panel__rows">
         <div v-for="s in segments" :key="s.key" class="ctx-panel__row">
           <span class="ctx-panel__dot" :style="{ background: s.color }" />
           <span class="ctx-panel__label">{{ s.label }}</span>
@@ -99,13 +117,18 @@ const barSegments = computed(() => {
 
       <div class="ctx-panel__foot">
         <span v-if="usage.willCompact" class="ctx-panel__compact-hint">{{ $t('chat.contextUsage.willCompact') }}</span>
-        <span class="ctx-panel__estimate">{{ $t('chat.contextUsage.estimated') }}</span>
+        <span v-if="!hasProviderMeasurement" class="ctx-panel__estimate">{{ $t('chat.contextUsage.estimated') }}</span>
       </div>
     </div>
   </el-popover>
 </template>
 
 <style scoped>
+.ctx-usage-unavailable {
+  font-size: 11px;
+  color: var(--mc-text-tertiary, #94a3b8);
+}
+
 .ctx-chip {
   display: inline-flex;
   align-items: center;

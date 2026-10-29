@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "must-not-load": {
+      "command": "must-not-run",
+      "args": ["--acceptance-fixture"]
+    }
+  }
+}

@@ -82,6 +82,7 @@
                so unhealthy rows render as dimmed entries with status chips and a Fix
                button instead of disappearing entirely. -->
           <ModelSelector
+            v-if="currentAgentRuntimeType !== 'copilot'"
             :providers="providers"
             :active-value="activeModelValue"
             :active-label="activeModelLabel"
@@ -350,6 +351,7 @@ import { useMermaidRenderer, handleMermaidDownload } from '@/composables/useMerm
 import { useGoalStore } from '@/stores/useGoalStore'
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
 import { buildViewerModelProviders } from '@/utils/viewerModelProviders'
+import { copilotModelOverride, normalizeRuntimeType } from '@/utils/runtimeSelection'
 import GoalSetInlinePrompt from '@/components/goal/GoalSetInlinePrompt.vue'
 import GoalSystemLine from '@/components/goal/GoalSystemLine.vue'
 
@@ -586,6 +588,20 @@ function selectModel(value: string) {
  */
 function agentSeedModel(): { providerId: string; model: string } | null {
   const cap = agentCapabilities.value
+  if (currentAgentRuntimeType.value === 'copilot') {
+    if (cap?.providerId === 'copilot' && cap.modelName) {
+      return { providerId: 'copilot', model: cap.modelName }
+    }
+    let override: string | null
+    try {
+      override = copilotModelOverride(currentAgent.value?.runtimeConfig)
+    } catch {
+      mcToast.error(t('agents.messages.copilotRuntimeConfigInvalid'))
+      return null
+    }
+    const model = override || currentAgent.value?.modelName
+    return model ? { providerId: 'copilot', model } : null
+  }
   if (cap?.providerId && cap?.modelName) {
     return { providerId: cap.providerId, model: cap.modelName }
   }
@@ -612,6 +628,15 @@ function agentSeedModel(): { providerId: string; model: string } | null {
  * which outranks the agent override and silently clobbered it.
  */
 function applyConversationModel(conv?: Conversation | null) {
+  if (currentAgentRuntimeType.value === 'copilot') {
+    if (conv?.modelProvider === 'copilot' && conv.modelName) {
+      activeModels.value = { activeLlm: { providerId: 'copilot', model: conv.modelName } }
+      return
+    }
+    const agentModel = agentSeedModel()
+    activeModels.value = agentModel ? { activeLlm: agentModel } : null
+    return
+  }
   if (conv?.modelProvider && conv?.modelName) {
     activeModels.value = { activeLlm: { providerId: conv.modelProvider, model: conv.modelName } }
     return
@@ -921,7 +946,7 @@ const currentAgentRuntimeMode = computed(() => {
   return a.agentType === 'react' ? t('agents.types.react') : t('agents.types.planExecute')
 })
 
-const currentAgentRuntimeType = computed(() => currentAgent.value?.runtimeType === 'dsh' ? 'dsh' : 'native')
+const currentAgentRuntimeType = computed(() => normalizeRuntimeType(currentAgent.value?.runtimeType))
 const currentAgentRuntimeLabel = computed(() => t(`agents.runtime.${currentAgentRuntimeType.value}`))
 
 // Per-conversation last-viewed timestamp store (localStorage-backed, MVP).
@@ -1563,6 +1588,13 @@ function onGoalSystemLineDismiss() {
 // the user attaches an image / video.
 watch(selectedAgentId, async (id) => {
   if (!id) { agentCapabilities.value = null; return }
+  agentCapabilities.value = null
+  const selectedConversation = conversations.value.find(
+    conversation => conversation.conversationId === currentConversationId.value,
+  )
+  if (currentAgentRuntimeType.value === 'copilot') {
+    applyConversationModel(selectedConversation)
+  }
   try {
     const res: any = await agentApi.getCapabilities(id)
     agentCapabilities.value = res.data || null
@@ -1574,6 +1606,7 @@ watch(selectedAgentId, async (id) => {
     // hasn't manually picked a model, so we never clobber an explicit choice.
     const conv = conversations.value.find(c => c.conversationId === currentConversationId.value)
     const hasServerPin = !!(conv?.modelProvider && conv?.modelName)
+      && (currentAgentRuntimeType.value !== 'copilot' || conv?.modelProvider === 'copilot')
     if (!hasServerPin && !userPickedModel.value) {
       applyConversationModel(conv)
     }
@@ -1640,6 +1673,10 @@ async function loadModelState() {
       return
     }
   } catch (e) {
+    if (currentAgentRuntimeType.value === 'copilot') {
+      recomputePromptFlags()
+      return
+    }
     mcToast.error(t('chat.loadModelFailed'))
     blockingPrompt.value = true
     recoverablePrompt.value = false
@@ -1677,6 +1714,13 @@ function recomputePromptFlags() {
     recoverableDismissed.value = false
     return
   }
+  // Copilot resolves its own model and does not use native provider liveness.
+  if (currentAgentRuntimeType.value === 'copilot') {
+    blockingPrompt.value = false
+    recoverablePrompt.value = false
+    recoverableDismissed.value = false
+    return
+  }
   // Viewer-level users cannot read the provider list (admin-only because it
   // returns API keys), so we can't compute liveness. Trust the active model
   // and let the agent runtime surface any per-call failure instead of
@@ -1708,7 +1752,7 @@ function recomputePromptFlags() {
 // Issue #81 v2 R2: keep blocking/recoverable in sync with the providers list
 // and the active model selection without forcing every mutation site to call
 // recomputePromptFlags() manually.
-watch([providers, activeModels], recomputePromptFlags, { deep: true })
+watch([providers, activeModels, currentAgentRuntimeType], recomputePromptFlags, { deep: true })
 
 async function loadConversations() {
   try {
@@ -2742,6 +2786,11 @@ function handleCodeCopy(e: MouseEvent) {
   border-color: rgba(24, 126, 104, 0.28);
   color: #187e68;
   background: rgba(24, 126, 104, 0.08);
+}
+.agent-runtime-badge--copilot {
+  border-color: rgba(111, 66, 193, 0.28);
+  color: #6f42c1;
+  background: rgba(111, 66, 193, 0.08);
 }
 
 

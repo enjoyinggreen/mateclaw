@@ -10,8 +10,28 @@ public record RuntimeSession(
         Long workspaceId,
         String modelName,
         Path workingDirectory,
-        Map<String, Object> configuration
+        Map<String, Object> configuration,
+        RuntimeTurnContext turnContext
 ) {
+    public RuntimeSession(
+            String sessionId,
+            String conversationId,
+            Long agentId,
+            Long workspaceId,
+            String modelName,
+            Path workingDirectory,
+            Map<String, Object> configuration) {
+        this(
+                sessionId,
+                conversationId,
+                agentId,
+                workspaceId,
+                modelName,
+                workingDirectory,
+                configuration,
+                null);
+    }
+
     public RuntimeSession {
         if (sessionId == null || sessionId.isBlank()) throw new IllegalArgumentException("sessionId is required");
         if (conversationId == null || conversationId.isBlank()) throw new IllegalArgumentException("conversationId is required");

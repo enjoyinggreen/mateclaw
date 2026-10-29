@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -173,6 +174,7 @@ public class ChatController {
 
         // ---- 分支 B：正常请求 ----
         Long agentId = request.getAgentId();
+        String runtimeProviderAtStart = "native";
         String requestMessage = request.getMessage() != null ? request.getMessage() : "";
         if (auth == null) {
             try {
@@ -189,6 +191,9 @@ public class ChatController {
         // ---- Workspace 边界校验：确保 agent 属于当前 workspace ----
         if (agentId != null) {
             AgentEntity agent = agentService.getAgent(agentId);
+            if (agent != null) {
+                runtimeProviderAtStart = normalizedRuntimeProvider(agent.getRuntimeType());
+            }
             if (agent != null && agent.getWorkspaceId() != null) {
                 long wsId = workspaceId != null ? workspaceId : 1L;
                 if (!agent.getWorkspaceId().equals(wsId)) {
@@ -289,11 +294,13 @@ public class ChatController {
 
             final PendingApproval finalConsumed = consumed;
             final String decision = isApprovalCommand ? "approved" : "denied";
+            Long approvalAgentId = parseLongOrNull(pending.getAgentId());
+            String approvalRuntimeProvider = runtimeProviderFor(approvalAgentId);
 
             streamTracker.register(conversationId);
             setupPermit.close();
-            Long approvalAgentId = parseLongOrNull(pending.getAgentId());
-            streamTracker.bindRunMeta(conversationId, approvalAgentId, username);
+            streamTracker.bindRunMeta(conversationId, approvalAgentId, username,
+                    approvalRuntimeProvider);
             registerEmitterCallbacks(emitter, conversationId);
             streamTracker.attach(conversationId, emitter);
             AtomicBoolean approvalEmitterDone = new AtomicBoolean(false);
@@ -612,7 +619,8 @@ public class ChatController {
         // ---- 正常请求：注册流状态并附着首个订阅者 ----
         streamTracker.register(conversationId);
         setupPermit.close();
-        streamTracker.bindRunMeta(conversationId, agentId, username);
+        streamTracker.bindRunMeta(
+                conversationId, agentId, username, runtimeProviderAtStart);
         registerEmitterCallbacks(emitter, conversationId);
         streamTracker.attach(conversationId, emitter);
 
@@ -660,6 +668,11 @@ public class ChatController {
                     originMessageId = regenerateSeed.seedMessageId();
                 }
                 conversationService.updateStreamStatus(conversationId, "running");
+                CopilotTurnMarker copilotTurn = beginCopilotTurnIfSelected(agentId, conversationId);
+                if (copilotTurn != null) {
+                    accumulator.associateCopilotTurn(
+                            copilotTurn.executionId(), copilotTurn.assistantMessageId());
+                }
 
                 broadcastEvent(conversationId, "session", Map.of(
                         "conversationId", conversationId,
@@ -674,7 +687,13 @@ public class ChatController {
                 // tools that need a workspace path read it from the agent (origin
                 // is enriched with workspaceBasePath in StateGraph buildInitialState).
                 vip.mate.agent.context.ChatOrigin webOrigin = selectedTurnOrigin.withOriginMessageId(originMessageId);
-                Disposable disposable = agentService.chatStructuredStream(agentId, promptText, conversationId, username, request.getThinkingLevel(), webOrigin)
+                reactor.core.publisher.Flux<AgentService.StreamDelta> runtimeStream = copilotTurn == null
+                        ? agentService.chatStructuredStream(agentId, promptText, conversationId, username,
+                                request.getThinkingLevel(), webOrigin)
+                        : agentService.chatStructuredStream(agentId, promptText, conversationId, username,
+                                request.getThinkingLevel(), webOrigin,
+                                copilotTurn.executionId(), copilotTurn.assistantMessageId());
+                Disposable disposable = runtimeStream
                         .doOnNext(delta -> {
                             if (emitterDone.get()) return;
                             try {
@@ -730,10 +749,14 @@ public class ChatController {
                             boolean wasStopped = streamTracker.isStopRequested(conversationId);
                             ChatStreamTracker.InterruptType interruptType = streamTracker.getInterruptType(conversationId);
                             boolean isInterruptFollowup = interruptType == ChatStreamTracker.InterruptType.USER_INTERRUPT_WITH_FOLLOWUP;
-                            boolean isError = accumulator.getContent() != null
-                                    && accumulator.getContent().startsWith("[错误] ");
+                            boolean isError = "failed".equals(accumulator.getRuntimeOutcome())
+                                    || (accumulator.getContent() != null
+                                    && accumulator.getContent().startsWith("[错误] "));
                             String persistStatus = derivePersistStatus(
                                     accumulator.isAwaitingApproval(), isError, wasStopped, interruptType);
+                            if (accumulator.isCopilotTurn()) {
+                                persistStatus = copilotPersistStatus(accumulator, persistStatus);
+                            }
                             try {
                                 MessageEntity savedAssistant = null;
                                 List<MessageContentPart> assistantParts = accumulator.toAssistantParts();
@@ -741,19 +764,12 @@ public class ChatController {
                                 if (!assistantText.isBlank() || !assistantParts.isEmpty()) {
                                     String savedText = assistantText.isBlank() && wasStopped
                                             ? (isInterruptFollowup ? "[已中断]" : "[已停止生成]") : assistantText;
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant", savedText, assistantParts,
-                                            persistStatus,
-                                            accumulator.getPromptTokens(),
-                                            accumulator.getCompletionTokens(),
-                                            accumulator.getCacheReadTokens(),
-                                            accumulator.getCacheWriteTokens(),
-                                            accumulator.getReasoningTokens(),
-                                            accumulator.getRuntimeModelName(),
-                                            accumulator.getRuntimeProviderId(),
-                                            accumulator.toMetadataJson());
+                                    savedAssistant = persistAssistantTurn(
+                                            conversationId, savedText, assistantParts, persistStatus, accumulator);
                                 } else if (wasStopped) {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, persistStatus);
+                                    savedAssistant = persistAssistantTurn(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]",
+                                            List.of(), persistStatus, accumulator);
                                 } else {
                                     savedAssistant = saveEmptyAssistantPlaceholder(
                                             conversationId, persistStatus, accumulator, "SSE doOnComplete");
@@ -853,6 +869,10 @@ public class ChatController {
                             ChatStreamTracker.InterruptType interruptType = streamTracker.getInterruptType(conversationId);
                             boolean isInterruptFollowup = interruptType == ChatStreamTracker.InterruptType.USER_INTERRUPT_WITH_FOLLOWUP;
                             String status = isInterruptFollowup ? "interrupted" : "stopped";
+                            if (accumulator.isCopilotTurn()) {
+                                status = "stopped";
+                                accumulator.ensureCopilotOutcome("cancelled");
+                            }
 
                             log.info("SSE stream cancelled ({}): conversationId={}", status, conversationId);
                             try {
@@ -862,19 +882,12 @@ public class ChatController {
                                 if (!assistantText.isBlank() || !assistantParts.isEmpty()) {
                                     String savedText = assistantText.isBlank()
                                             ? (isInterruptFollowup ? "[已中断]" : "[已停止生成]") : assistantText;
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant", savedText, assistantParts,
-                                            status,
-                                            accumulator.getPromptTokens(),
-                                            accumulator.getCompletionTokens(),
-                                            accumulator.getCacheReadTokens(),
-                                            accumulator.getCacheWriteTokens(),
-                                            accumulator.getReasoningTokens(),
-                                            accumulator.getRuntimeModelName(),
-                                            accumulator.getRuntimeProviderId(),
-                                            accumulator.toMetadataJson());
+                                    savedAssistant = persistAssistantTurn(
+                                            conversationId, savedText, assistantParts, status, accumulator);
                                 } else {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, status);
+                                    savedAssistant = persistAssistantTurn(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]",
+                                            List.of(), status, accumulator);
                                 }
 
                                 if (isInterruptFollowup) {
@@ -946,6 +959,9 @@ public class ChatController {
                             // 三态：interrupted > stopped > failed
                             String status = !isUserStop ? "failed"
                                     : isInterruptFollowup ? "interrupted" : "stopped";
+                            if (accumulator.isCopilotTurn()) {
+                                status = copilotPersistStatus(accumulator, status);
+                            }
 
                             if (isInterruptFollowup) {
                                 log.info("SSE stream interrupted for follow-up (CancellationException): conversationId={}", conversationId);
@@ -967,21 +983,15 @@ public class ChatController {
                                 if (!assistantText.isBlank() || !assistantParts.isEmpty()) {
                                     String savedText = assistantText.isBlank() && isUserStop
                                             ? (isInterruptFollowup ? "[已中断]" : "[已停止生成]") : assistantText;
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant", savedText, assistantParts,
-                                            status,
-                                            accumulator.getPromptTokens(),
-                                            accumulator.getCompletionTokens(),
-                                            accumulator.getCacheReadTokens(),
-                                            accumulator.getCacheWriteTokens(),
-                                            accumulator.getReasoningTokens(),
-                                            accumulator.getRuntimeModelName(),
-                                            accumulator.getRuntimeProviderId(),
-                                            accumulator.toMetadataJson());
+                                    savedAssistant = persistAssistantTurn(
+                                            conversationId, savedText, assistantParts, status, accumulator);
                                 } else if (isUserStop) {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, status);
+                                    savedAssistant = persistAssistantTurn(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]",
+                                            List.of(), status, accumulator);
                                 } else {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant", "[错误] " + errorMsg, null, "failed");
+                                    savedAssistant = persistAssistantTurn(conversationId,
+                                            "[错误] " + errorMsg, List.of(), status, accumulator);
                                 }
 
                                 if (isInterruptFollowup) {
@@ -1050,6 +1060,17 @@ public class ChatController {
 
             } catch (Exception e) {
                 log.error("SSE setup error: {}", e.getMessage());
+                if (accumulator.isCopilotTurn()) {
+                    try {
+                        accumulator.ensureCopilotOutcome("failed");
+                        persistAssistantTurn(conversationId,
+                                "[错误] " + (e.getMessage() == null ? "unknown error" : e.getMessage()),
+                                List.of(), "failed", accumulator);
+                    } catch (Exception persistError) {
+                        log.error("SSE Copilot setup failure finalization failed: {}",
+                                persistError.getMessage(), persistError);
+                    }
+                }
                 try {
                     broadcastEvent(conversationId, "error", Map.of("message", e.getMessage() != null ? e.getMessage() : "unknown error"));
                 } catch (Exception ioException) {
@@ -1215,14 +1236,43 @@ public class ChatController {
                 memoryOrigin(request.getConversationId(), username, requesterUserIdOf(auth), workspaceId,
                         request.getEndUserId()), agentId).withOriginMessageId(
                                 savedUser == null ? null : savedUser.getId());
-        AgentService.ChatResult result = turnGate.withPermit(permit, () ->
-                agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin));
+        CopilotTurnMarker copilotTurn = beginCopilotTurnIfSelected(agentId, request.getConversationId());
+        AgentService.ChatResult result;
+        try {
+            result = turnGate.withPermit(permit, () -> copilotTurn == null
+                    ? agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin)
+                    : agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin,
+                            copilotTurn.executionId(), copilotTurn.assistantMessageId()));
+        } catch (RuntimeException error) {
+            if (copilotTurn != null) {
+                finalizeCopilotTurnAfterSyncError(request.getConversationId(), copilotTurn, error);
+            }
+            throw error;
+        }
         String response = result.content();
-        conversationService.saveMessage(request.getConversationId(), "assistant", response, null, "completed",
-                result.promptTokens(), result.completionTokens(),
-                result.runtimeModel(), result.runtimeProvider());
-        completionPublisher.publish(agentId, request.getConversationId(), request.getMessage(), response, "web",
-                memoryOwnerResolver.resolve(webOrigin));
+        if (copilotTurn != null) {
+            String outcome = Set.of("completed", "failed", "cancelled").contains(result.runtimeOutcome())
+                    ? result.runtimeOutcome() : "failed";
+            persistCopilotChatResult(request.getConversationId(), copilotTurn, result, outcome);
+            if ("failed".equals(outcome)) {
+                String errorMessage = result.errorMessage() == null || result.errorMessage().isBlank()
+                        ? "Copilot runtime failed"
+                        : result.errorMessage();
+                return R.fail(502, errorMessage);
+            }
+            if (!"cancelled".equals(outcome)) {
+                completionPublisher.publish(agentId, request.getConversationId(), request.getMessage(), response, "web",
+                        memoryOwnerResolver.resolve(webOrigin));
+            } else {
+                return R.fail(409, "Copilot turn was cancelled");
+            }
+        } else {
+            conversationService.saveMessage(request.getConversationId(), "assistant", response, null, "completed",
+                    result.promptTokens(), result.completionTokens(),
+                    result.runtimeModel(), result.runtimeProvider());
+            completionPublisher.publish(agentId, request.getConversationId(), request.getMessage(), response, "web",
+                    memoryOwnerResolver.resolve(webOrigin));
+        }
         return R.ok(response);
         }
     }
@@ -1477,6 +1527,18 @@ public class ChatController {
         return details instanceof Long id ? id : null;
     }
 
+    private String runtimeProviderFor(Long agentId) {
+        return agentId == null
+                ? "native"
+                : normalizedRuntimeProvider(agentService.getAgent(agentId).getRuntimeType());
+    }
+
+    private static String normalizedRuntimeProvider(String runtimeType) {
+        return runtimeType == null || runtimeType.isBlank()
+                ? "native"
+                : runtimeType.trim().toLowerCase(java.util.Locale.ROOT);
+    }
+
     /**
      * Resolve {@code scheme://host[:port][/contextPath]} from the current request,
      * honouring {@code X-Forwarded-*} when a {@code ForwardedHeaderFilter} is active.
@@ -1582,6 +1644,7 @@ public class ChatController {
             completeEmitterQuietly(emitter, emitterDone);
             return;
         }
+        String queuedRuntimeProvider = runtimeProviderFor(agentId);
 
         // A row queued by an older binary has no selection snapshot. If this
         // conversation has managed Goal history, execution could turn an old
@@ -1661,6 +1724,8 @@ public class ChatController {
 
         // 重新注册流状态
         streamTracker.register(conversationId);
+        streamTracker.bindRunMeta(conversationId, agentId, preConsumedInput.createdBy(),
+                queuedRuntimeProvider);
         streamTracker.attach(conversationId, emitter);
 
         // 启动新的流（复用现有 sseExecutor.execute 的逻辑模式）
@@ -1680,7 +1745,18 @@ public class ChatController {
                                 queuedConversation.getWorkspaceId(), null, baseUrl, preConsumedInput.requesterUserId())
                         .withOriginMessageId(queuedOriginMessageId)
                         .withSelectedGoalId(preConsumedInput.selectedGoalId());
-        Disposable disposable = agentService.chatStructuredStream(agentId, queuedMessage, conversationId, preConsumedInput.createdBy(), null, queuedOrigin)
+        CopilotTurnMarker copilotTurn = beginCopilotTurnIfSelected(agentId, conversationId);
+        if (copilotTurn != null) {
+            accumulator.associateCopilotTurn(copilotTurn.executionId(), copilotTurn.assistantMessageId());
+        }
+        reactor.core.publisher.Flux<AgentService.StreamDelta> queuedStream = reactor.core.publisher.Flux.defer(
+                () -> copilotTurn == null
+                        ? agentService.chatStructuredStream(agentId, queuedMessage, conversationId,
+                                preConsumedInput.createdBy(), null, queuedOrigin)
+                        : agentService.chatStructuredStream(agentId, queuedMessage, conversationId,
+                                preConsumedInput.createdBy(), null, queuedOrigin,
+                                copilotTurn.executionId(), copilotTurn.assistantMessageId()));
+        Disposable disposable = queuedStream
                 .doOnNext(delta -> {
                     if (emitterDone.get()) return;
                     try {
@@ -1697,30 +1773,27 @@ public class ChatController {
                     // expirePendingApprovals on the frontend and ghost-clear the banner).
                     boolean queuedWasStopped = streamTracker.isStopRequested(conversationId);
                     ChatStreamTracker.InterruptType queuedInterrupt = streamTracker.getInterruptType(conversationId);
-                    boolean queuedIsError = accumulator.getContent() != null
-                            && accumulator.getContent().startsWith("[错误] ");
+                    boolean queuedIsError = "failed".equals(accumulator.getRuntimeOutcome())
+                            || (accumulator.getContent() != null
+                            && accumulator.getContent().startsWith("[错误] "));
                     String persistStatus = derivePersistStatus(
                             accumulator.isAwaitingApproval(), queuedIsError,
                             queuedWasStopped, queuedInterrupt);
+                    if (accumulator.isCopilotTurn()) {
+                        persistStatus = copilotPersistStatus(accumulator, persistStatus);
+                    }
                     try {
                         MessageEntity savedAssistant = null;
                         List<MessageContentPart> parts = accumulator.toAssistantParts();
                         String text = accumulator.getContent();
                         if (!text.isBlank() || !parts.isEmpty()) {
-                            savedAssistant = conversationService.saveMessage(conversationId, "assistant", text, parts,
-                                    persistStatus,
-                                    accumulator.getPromptTokens(),
-                                    accumulator.getCompletionTokens(),
-                                    accumulator.getCacheReadTokens(),
-                                    accumulator.getCacheWriteTokens(),
-                                    accumulator.getReasoningTokens(),
-                                    accumulator.getRuntimeModelName(),
-                                    accumulator.getRuntimeProviderId(),
-                                    accumulator.toMetadataJson());
+                            savedAssistant = persistAssistantTurn(
+                                    conversationId, text, parts, persistStatus, accumulator);
                         } else if (queuedWasStopped) {
                             boolean queuedIsFollowup = queuedInterrupt == ChatStreamTracker.InterruptType.USER_INTERRUPT_WITH_FOLLOWUP;
-                            savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                    queuedIsFollowup ? "[已中断]" : "[已停止生成]", null, persistStatus);
+                            savedAssistant = persistAssistantTurn(conversationId,
+                                    queuedIsFollowup ? "[已中断]" : "[已停止生成]",
+                                    List.of(), persistStatus, accumulator);
                         } else {
                             savedAssistant = saveEmptyAssistantPlaceholder(
                                     conversationId, persistStatus, accumulator, "SSE queued doOnComplete");
@@ -1761,21 +1834,14 @@ public class ChatController {
                         MessageEntity savedAssistant = null;
                         List<MessageContentPart> parts = accumulator.toAssistantParts();
                         String text = accumulator.getContent();
+                        if (accumulator.isCopilotTurn()) accumulator.ensureCopilotOutcome("failed");
                         if (!text.isBlank() || !parts.isEmpty()) {
-                            savedAssistant = conversationService.saveMessage(conversationId, "assistant", text, parts,
-                                    "failed",
-                                    accumulator.getPromptTokens(),
-                                    accumulator.getCompletionTokens(),
-                                    accumulator.getCacheReadTokens(),
-                                    accumulator.getCacheWriteTokens(),
-                                    accumulator.getReasoningTokens(),
-                                    accumulator.getRuntimeModelName(),
-                                    accumulator.getRuntimeProviderId(),
-                                    accumulator.toMetadataJson());
+                            savedAssistant = persistAssistantTurn(
+                                    conversationId, text, parts, "failed", accumulator);
                         } else {
                             String errorMsg = e.getMessage() != null ? e.getMessage() : "queued stream error";
-                            savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                    "[错误] " + errorMsg, null, "failed");
+                            savedAssistant = persistAssistantTurn(conversationId,
+                                    "[错误] " + errorMsg, List.of(), "failed", accumulator);
                         }
                         broadcastEvent(conversationId, "error", buildErrorPayload(
                                 conversationId,
@@ -1968,16 +2034,8 @@ public class ChatController {
         log.warn("{} with empty accumulator: conversationId={}, status={}, finishReason={}, phase={}, hasSegments={}",
                 source, conversationId, status, accumulator.getFinishReason(),
                 accumulator.getCurrentPhase(), !accumulator.segmentsEmpty());
-        return conversationService.saveMessage(conversationId, "assistant",
-                emptyAssistantPlaceholder(status), null, status,
-                accumulator.getPromptTokens(),
-                accumulator.getCompletionTokens(),
-                accumulator.getCacheReadTokens(),
-                accumulator.getCacheWriteTokens(),
-                accumulator.getReasoningTokens(),
-                accumulator.getRuntimeModelName(),
-                accumulator.getRuntimeProviderId(),
-                accumulator.toMetadataJson());
+        return persistAssistantTurn(conversationId, emptyAssistantPlaceholder(status),
+                List.of(), status, accumulator);
     }
 
     private Map<String, Object> buildDonePayload(String conversationId, String status, MessageEntity savedAssistant,
@@ -2005,28 +2063,14 @@ public class ChatController {
             // a refetch via /messages. Inlining them in the done payload lets
             // the client merge the markers onto its local segments by id
             // without an extra HTTP round-trip.
-            String rawMetadata = savedAssistant.getMetadata();
-            if (rawMetadata != null && !rawMetadata.isBlank()) {
-                try {
-                    // Without the unwrap this readValue throws on the H2 profile
-                    // and the catch below swallows it, so the superseded markers
-                    // never ride the done payload and every client waits for a
-                    // reload instead — a degradation with no symptom in the log.
-                    Map<String, Object> parsed = objectMapper.readValue(
-                            MessageMetadataJson.normalize(rawMetadata),
-                            new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
-                    Object segs = parsed.get("segments");
-                    if (segs instanceof java.util.List<?> list && !list.isEmpty()) {
-                        payload.put("segments", segs);
-                    }
-                } catch (Exception ignored) {
-                    // Best-effort: malformed metadata just means the client falls
-                    // back to its existing "wait for reload" reconcile path.
-                }
-            }
+            addPersistedMetadataToPayload(payload, savedAssistant);
         }
-        if (promptTokens > 0) payload.put("promptTokens", promptTokens);
-        if (completionTokens > 0) payload.put("completionTokens", completionTokens);
+        boolean copilotTurn = savedAssistant != null
+                && "copilot".equalsIgnoreCase(savedAssistant.getRuntimeProvider());
+        if (!payload.containsKey("usageAvailability") && !copilotTurn) {
+            if (promptTokens > 0) payload.put("promptTokens", promptTokens);
+            if (completionTokens > 0) payload.put("completionTokens", completionTokens);
+        }
         // Cache / reasoning detail rides on the persisted row so the live bubble
         // can render the usage breakdown without waiting for a history reload.
         if (savedAssistant != null) {
@@ -2051,8 +2095,37 @@ public class ChatController {
         if (conversationId != null && !conversationId.isBlank()) payload.put("conversationId", conversationId);
         if (savedAssistant != null && savedAssistant.getId() != null) {
             payload.put("assistantMessageId", savedAssistant.getId());
+            addPersistedMetadataToPayload(payload, savedAssistant);
         }
         return payload;
+    }
+
+    private void addPersistedMetadataToPayload(Map<String, Object> payload, MessageEntity message) {
+        String rawMetadata = message.getMetadata();
+        if (rawMetadata == null || rawMetadata.isBlank()) return;
+        try {
+            Map<String, Object> parsed = objectMapper.readValue(
+                    MessageMetadataJson.normalize(rawMetadata),
+                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+            Object segments = parsed.get("segments");
+            if (segments instanceof List<?> list && !list.isEmpty()) payload.put("segments", list);
+            for (String key : List.of("runtimeExecutionId", "assistantMessageId", "runtimeOutcome",
+                    "runtimeProviderId", "runtimeModelName", "runtimeErrorMessage")) {
+                Object value = parsed.get(key);
+                if (value != null) payload.put(key, value);
+            }
+            Object rawAvailability = parsed.get("usageAvailability");
+            if (rawAvailability instanceof Map<?, ?> availability) {
+                payload.put("usageAvailability", availability);
+                for (String field : List.of("promptTokens", "completionTokens", "contextTokens", "contextWindow")) {
+                    if (!Boolean.TRUE.equals(availability.get(field))) continue;
+                    Object value = parsed.get(field);
+                    if (value instanceof Number) payload.put(field, value);
+                }
+            }
+        } catch (Exception ignored) {
+            // Malformed metadata falls back to history reload for reconciliation.
+        }
     }
 
     /**
@@ -2070,36 +2143,28 @@ public class ChatController {
      *       while the approval is still recoverable).</li>
      *   <li>Otherwise {@code interrupted_shutdown} as before.</li>
      * </ul>
-     * Idempotent w.r.t. the normal doOnComplete/doOnError save: if those paths already
-     * persisted the message, this writes a second row, which is rare in practice
-     * (race window is sub-second between dispose and save) and acceptable. Skipping
-     * save when nothing to save avoids empty rows.
+     * Copilot turns finalize their existing marker; other runtimes retain the
+     * legacy emergency-save behavior.
      */
     private void emergencySaveAccumulator(String conversationId, AgentStreamAccumulator accumulator) {
         try {
             String text = accumulator.getContent();
             List<MessageContentPart> parts = accumulator.toAssistantParts();
-            if (text.isBlank() && parts.isEmpty()) {
+            if (text.isBlank() && parts.isEmpty() && !accumulator.isCopilotTurn()) {
                 log.warn("[ChatController] Emergency save skipped (empty accumulator): conversationId={}, finishReason={}, phase={}, hasSegments={}",
                         conversationId, accumulator.getFinishReason(), accumulator.getCurrentPhase(),
                         !accumulator.segmentsEmpty());
                 return;
             }
             boolean awaitingApproval = accumulator.isAwaitingApproval();
-            String status = awaitingApproval ? "awaiting_approval" : "interrupted_shutdown";
+            String status = accumulator.isCopilotTurn()
+                    ? "stopped"
+                    : awaitingApproval ? "awaiting_approval" : "interrupted_shutdown";
+            if (accumulator.isCopilotTurn()) accumulator.ensureCopilotOutcome("cancelled");
             String savedText = text.isBlank()
                     ? (awaitingApproval ? "[等待审批 — 服务重启]" : "[已中断 — 服务重启]")
                     : text;
-            conversationService.saveMessage(conversationId, "assistant", savedText, parts,
-                    status,
-                    accumulator.getPromptTokens(),
-                    accumulator.getCompletionTokens(),
-                    accumulator.getCacheReadTokens(),
-                    accumulator.getCacheWriteTokens(),
-                    accumulator.getReasoningTokens(),
-                    accumulator.getRuntimeModelName(),
-                    accumulator.getRuntimeProviderId(),
-                    accumulator.toMetadataJson());
+            persistAssistantTurn(conversationId, savedText, parts, status, accumulator);
             log.info("[ChatController] Emergency-saved in-flight assistant message: " +
                     "conversationId={}, status={}, textLen={}, partsCount={}",
                     conversationId, status, text.length(), parts.size());
@@ -2108,6 +2173,122 @@ public class ChatController {
                     conversationId, e.getMessage(), e);
         }
     }
+
+    private CopilotTurnMarker beginCopilotTurnIfSelected(Long agentId, String conversationId) {
+        AgentEntity agent = agentService.getAgent(agentId);
+        if (agent == null || !"copilot".equalsIgnoreCase(agent.getRuntimeType())) return null;
+        String executionId = UUID.randomUUID().toString();
+        MessageEntity marker = conversationService.beginCopilotTurn(
+                conversationId, executionId, "copilot", null);
+        if (marker == null || marker.getId() == null) {
+            throw new IllegalStateException("Copilot assistant marker was not persisted");
+        }
+        return new CopilotTurnMarker(executionId, marker.getId());
+    }
+
+    private String copilotPersistStatus(AgentStreamAccumulator accumulator, String fallbackStatus) {
+        String outcome = accumulator.getRuntimeOutcome();
+        if (!Set.of("completed", "failed", "cancelled").contains(outcome)) {
+            outcome = switch (fallbackStatus) {
+                case "completed" -> "completed";
+                case "failed", "error" -> "failed";
+                default -> "cancelled";
+            };
+        }
+        accumulator.ensureCopilotOutcome(outcome);
+        return switch (outcome) {
+            case "completed" -> "completed";
+            case "failed" -> "failed";
+            default -> "stopped";
+        };
+    }
+
+    private MessageEntity persistAssistantTurn(String conversationId, String content,
+                                               List<MessageContentPart> parts, String status,
+                                               AgentStreamAccumulator accumulator) {
+        if (accumulator.isCopilotTurn()) {
+            String finalStatus = copilotPersistStatus(accumulator, status);
+            String executionId = accumulator.getRuntimeExecutionId();
+            Long assistantMessageId = accumulator.getAssistantMessageId();
+            if (executionId.isBlank() || assistantMessageId == null) {
+                throw new IllegalStateException("Copilot assistant marker identity is missing");
+            }
+            return conversationService.finalizeCopilotTurn(
+                    conversationId, assistantMessageId, executionId, content, finalStatus,
+                    accumulator.getRuntimeOutcome(), accumulator.toMetadataJson(),
+                    nullIfBlank(accumulator.getRuntimeModelName()),
+                    nullIfBlank(accumulator.getRuntimeProviderId()));
+        }
+        return conversationService.saveMessage(conversationId, "assistant", content, parts,
+                status,
+                accumulator.getPromptTokens(),
+                accumulator.getCompletionTokens(),
+                accumulator.getCacheReadTokens(),
+                accumulator.getCacheWriteTokens(),
+                accumulator.getReasoningTokens(),
+                accumulator.getRuntimeModelName(),
+                accumulator.getRuntimeProviderId(),
+                accumulator.toMetadataJson());
+    }
+
+    private void persistCopilotChatResult(String conversationId, CopilotTurnMarker marker,
+                                          AgentService.ChatResult result, String outcome) {
+        if (result.runtimeExecutionId() != null
+                && !marker.executionId().equals(result.runtimeExecutionId())) {
+            throw new IllegalStateException("Copilot result execution does not match its assistant marker");
+        }
+        if (result.assistantMessageId() != null
+                && !marker.assistantMessageId().equals(result.assistantMessageId())) {
+            throw new IllegalStateException("Copilot result marker does not match the generating assistant");
+        }
+        String status = switch (outcome) {
+            case "completed" -> "completed";
+            case "failed" -> "failed";
+            default -> "stopped";
+        };
+        MessageEntity finalized = conversationService.finalizeCopilotTurn(
+                conversationId, marker.assistantMessageId(), marker.executionId(), result.content(),
+                status, outcome, copilotResultMetadata(marker, outcome, result.runtimeModel(),
+                        result.runtimeProvider(), result.errorMessage()),
+                nullIfBlank(result.runtimeModel()), "copilot");
+        if (finalized == null) {
+            throw new IllegalStateException("Copilot assistant marker could not be finalized");
+        }
+    }
+
+    private void finalizeCopilotTurnAfterSyncError(
+            String conversationId, CopilotTurnMarker marker, RuntimeException error) {
+        MessageEntity finalized = conversationService.finalizeCopilotTurn(
+                conversationId, marker.assistantMessageId(), marker.executionId(), "",
+                "failed", "failed", copilotResultMetadata(
+                        marker, "failed", null, "copilot", error.getMessage()),
+                null, "copilot");
+        if (finalized == null) {
+            throw new IllegalStateException("Copilot assistant marker could not be finalized after failure", error);
+        }
+    }
+
+    private String copilotResultMetadata(CopilotTurnMarker marker, String outcome, String model,
+                                         String provider, String errorMessage) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("runtimeExecutionId", marker.executionId());
+        metadata.put("assistantMessageId", marker.assistantMessageId());
+        metadata.put("runtimeOutcome", outcome);
+        metadata.put("runtimeProviderId", provider == null || provider.isBlank() ? "copilot" : provider);
+        if (model != null && !model.isBlank()) metadata.put("runtimeModelName", model);
+        if (errorMessage != null && !errorMessage.isBlank()) metadata.put("runtimeErrorMessage", errorMessage);
+        try {
+            return objectMapper.writeValueAsString(metadata);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException error) {
+            throw new IllegalStateException("Could not serialize Copilot turn metadata", error);
+        }
+    }
+
+    private static String nullIfBlank(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    private record CopilotTurnMarker(String executionId, Long assistantMessageId) {}
 
     private List<MessageContentPart> normalizeRequestParts(ChatStreamRequest request) {
         if (request.getContentParts() != null && !request.getContentParts().isEmpty()) {

@@ -5,6 +5,7 @@ import vip.mate.planning.service.AgentRoutingDecisionAdapter;
 
 // PR-0b: DashScope imports moved with the construction code into DashScopeChatModelBuilder.
 import vip.mate.agent.runtime.AgentRuntime;
+import vip.mate.agent.runtime.RuntimeToolSetResolver;
 import vip.mate.agent.runtime.agentscope.NativePolicyDriver;
 import vip.mate.agent.runtime.agentscope.SpringToolSchemaAdapter;
 import vip.mate.agent.runtime.agentscope.ToolBatchResultAdapter;
@@ -64,7 +65,6 @@ import vip.mate.planning.service.PlanningService;
 import vip.mate.skill.runtime.SkillCatalogRenderer;
 import vip.mate.skill.service.SkillService;
 import vip.mate.system.service.SystemSettingService;
-import vip.mate.tool.ToolRegistry;
 import vip.mate.tool.disclosure.ToolUsageRecencyTracker;
 import vip.mate.tool.mcp.runtime.McpProgressContext;
 import vip.mate.memory.spi.MemoryManager;
@@ -99,17 +99,12 @@ import java.util.Set;
 @RequiredArgsConstructor
 public class AgentGraphBuilder {
 
-    private final ToolRegistry toolRegistry;
     private final AgentBindingService agentBindingService;
+    private final RuntimeToolSetResolver runtimeToolSetResolver;
     private final SkillService skillService;
     private final vip.mate.skill.runtime.SkillRuntimeService skillRuntimeService;
     private final vip.mate.tool.disclosure.ToolDisclosureService toolDisclosureService;
     private final vip.mate.agent.progress.ProgressLedgerService progressLedgerService;
-
-    /** Escape hatch: when false, the load_skill meta tool is not advertised. */
-    @org.springframework.beans.factory.annotation.Value(
-            "${mateclaw.skill.disclosure.load-skill-tool.enabled:true}")
-    private boolean loadSkillToolEnabled;
 
     private ToolExecutionCheckpoint executionCheckpoint;
 
@@ -142,7 +137,6 @@ public class AgentGraphBuilder {
     private final ProviderRouter providerRouter;
     private final PlanningService planningService;
     private final ToolGuardService toolGuardService;
-    private final vip.mate.tool.guard.service.ToolGuardConfigService toolGuardConfigService;
     private final ApprovalWorkflowService approvalService;
     private final ChatStreamTracker streamTracker;
     private final SystemSettingService systemSettingService;
@@ -223,6 +217,28 @@ public class AgentGraphBuilder {
     public void setAuditEventService(vip.mate.audit.service.AuditEventService s) {
         this.auditEventService = s;
     }
+
+    public CopilotToolExecutionContext createCopilotToolExecutionContext(AgentEntity employee) {
+        AgentToolSet toolSet = runtimeToolSetResolver.resolve(employee);
+        ToolExecutionExecutor executor = new ToolExecutionExecutor(
+                toolSet, toolGuardService, approvalService, streamTracker,
+                toolTimeoutProperties, toolResultStorage, toolConcurrencyRegistry,
+                workspaceLookupCache, approvalGrantResolver,
+                ToolExecutionExecutor.ApprovalContinuationPolicy.DISABLED);
+        executor.setSkillRuntimeService(skillRuntimeService);
+        executor.setUsageRecencyTracker(toolUsageRecencyTracker);
+        executor.setProgressContext(progressContext);
+        executor.setExecutionEvidenceRecorder(executionEvidenceRecorder);
+        executor.setExecutionCheckpoint(executionCheckpoint);
+        if (auditEventService != null) {
+            executor.setAuditEventService(auditEventService);
+        }
+        return new CopilotToolExecutionContext(toolSet, executor);
+    }
+
+    public record CopilotToolExecutionContext(
+            AgentToolSet toolSet,
+            ToolExecutionExecutor executor) {}
 
     /**
      * Reasoning retention policy for ReAct turns. Setter injection so the
@@ -325,40 +341,8 @@ public class AgentGraphBuilder {
      * the Agent's model override, then the global default.</p>
      */
     public BaseAgent build(AgentEntity entity, String modelProvider, String modelName) {
-        AgentToolSet toolSet = toolRegistry.getEnabledToolSet();
-
-        // Move 6 — Permission flattening at build time.
-        //
-        // Two layers of tool filtering exist in MateClaw:
-        //   (1) Build-time filter (HERE) — decides which tools the model SEES
-        //       in the tool list. Computed once per agent build; stable for
-        //       the agent's lifecycle unless bindings change.
-        //   (2) Runtime guard (ToolGuardService.evaluate) — decides which
-        //       tools the model can CALL. Runs on every invocation; checks
-        //       workspace boundaries, sensitive paths, credential exposure,
-        //       shell command patterns, and approval workflows. All dynamic
-        //       (depends on tool arguments, not just tool name).
-        //
-        // The build-time filter previously ran as 4 separate passes
-        // (deny → allow → deny → exclude). Move 6 consolidates them into
-        // a single deny-set + a single allow-set, applied in two passes:
-        //   denied = global denied ∪ skill-discovery denied ∪ {load_skill if disabled}
-        //   allowed = agent's bound tools (null = global default)
-        Set<String> deniedTools = new java.util.LinkedHashSet<>(
-                toolGuardConfigService.getDeniedTools());
-        deniedTools.addAll(agentBindingService.getSkillDiscoveryDeniedTools(entity.getId()));
-        if (!loadSkillToolEnabled) {
-            deniedTools.add("load_skill");
-        }
-        toolSet = toolSet.withDeniedToolsFiltered(deniedTools);
-
-        // RFC-090 §14.2 — single entry point that merges:
-        //   (a) tools expanded from bound skills' active features, and
-        //   (b) directly bound atomic tools (the Advanced bypass, §9.2 调整 B).
-        // Three-state semantics: null = no agent-level restriction (use
-        // global default); non-null (possibly empty) = explicit allowlist.
+        AgentToolSet toolSet = runtimeToolSetResolver.resolve(entity);
         Set<String> boundTools = agentBindingService.getEffectiveToolNames(entity.getId());
-        toolSet = toolSet.withAllowedToolsOnly(boundTools); // null = 全局默认
 
         // Resolve the base model with the precedence: per-conversation pin >
         // per-Agent model override > global default. resolveRuntimeBaseModel

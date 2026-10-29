@@ -30,6 +30,7 @@
             </div>
             <div class="focus-title">{{ run.agentName || t('live.unknownAgent') }}</div>
             <div class="focus-subtitle" v-if="run.username">@{{ run.username }}</div>
+            <div class="focus-provider" v-if="run.runtimeProvider">{{ run.runtimeProvider }}</div>
           </div>
 
           <!-- The one sentence: what it's doing right now. The tool name,
@@ -335,6 +336,15 @@ html.dark .focus-backdrop {
 .focus-subtitle {
   font-size: 13px;
   color: var(--mc-text-tertiary);
+}
+
+.focus-provider {
+  margin-top: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--mc-border-light);
+  border-radius: 999px;
+  color: var(--mc-text-secondary);
+  font-size: 11px;
 }
 
 /* ===== The one sentence + tool chip ===== */

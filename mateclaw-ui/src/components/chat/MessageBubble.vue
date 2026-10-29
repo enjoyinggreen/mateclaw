@@ -462,11 +462,15 @@
             class="action-model"
             :title="replyModelTitle"
           >{{ replyModel }}</span>
+          <ContextUsagePanel
+            v-if="role === 'assistant' && messageContextUsage"
+            :usage="messageContextUsage"
+          />
           <!-- Turn token total (assistant only): own usage + delegated sub-agents.
                Click opens the per-turn consumption breakdown panel (cache hit/miss/write,
                reasoning vs reply, cache hit rate). -->
           <el-popover
-            v-if="role === 'assistant' && tokenUsage"
+            v-if="role === 'assistant' && tokenUsage?.hasCounters"
             placement="top-end"
             trigger="click"
             :width="288"
@@ -479,14 +483,14 @@
                 :title="tokenUsage.delegated > 0
                   ? $t('chat.tokenUsageTooltipDelegated', {
                       total: tokenUsage.total.toLocaleString(),
-                      input: tokenUsage.input.toLocaleString(),
-                      output: tokenUsage.output.toLocaleString(),
+                      input: formatUsageValue(tokenUsage.input),
+                      output: formatUsageValue(tokenUsage.output),
                       delegated: tokenUsage.delegated.toLocaleString(),
                     })
                   : $t('chat.tokenUsageTooltip', {
                       total: tokenUsage.total.toLocaleString(),
-                      input: tokenUsage.input.toLocaleString(),
-                      output: tokenUsage.output.toLocaleString(),
+                      input: formatUsageValue(tokenUsage.input),
+                      output: formatUsageValue(tokenUsage.output),
                     })"
               >Σ {{ fmtTokens(tokenUsage.total) }} tok</button>
             </template>
@@ -499,7 +503,7 @@
               <div class="mc-usage-row mc-usage-row-main">
                 <i class="mc-usage-dot mc-dot-input"></i>
                 <span class="mc-usage-label">{{ $t('chat.usageDetail.input') }}</span>
-                <span class="mc-usage-value">{{ tokenUsage.input.toLocaleString() }}</span>
+                <span class="mc-usage-value">{{ formatUsageValue(tokenUsage.input) }}</span>
               </div>
               <template v-if="tokenUsage.hasCacheData">
                 <div class="mc-usage-row mc-usage-row-sub">
@@ -522,15 +526,15 @@
               <div class="mc-usage-row mc-usage-row-main">
                 <i class="mc-usage-dot mc-dot-output"></i>
                 <span class="mc-usage-label">{{ $t('chat.usageDetail.output') }}</span>
-                <span class="mc-usage-value">{{ tokenUsage.output.toLocaleString() }}</span>
+                <span class="mc-usage-value">{{ formatUsageValue(tokenUsage.output) }}</span>
               </div>
-              <div class="mc-usage-row mc-usage-row-sub">
+              <div v-if="!tokenUsage.isCopilot" class="mc-usage-row mc-usage-row-sub">
                 <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.reasoning') }}</span>
-                <span class="mc-usage-value">{{ tokenUsage.reasoning.toLocaleString() }}</span>
+                <span class="mc-usage-value">{{ formatUsageValue(tokenUsage.reasoning) }}</span>
               </div>
-              <div class="mc-usage-row mc-usage-row-sub">
+              <div v-if="!tokenUsage.isCopilot" class="mc-usage-row mc-usage-row-sub">
                 <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.reply') }}</span>
-                <span class="mc-usage-value">{{ tokenUsage.reply.toLocaleString() }}</span>
+                <span class="mc-usage-value">{{ formatUsageValue(tokenUsage.reply) }}</span>
               </div>
               <div v-if="tokenUsage.delegated > 0" class="mc-usage-row mc-usage-row-sub">
                 <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.delegated') }}</span>
@@ -556,6 +560,10 @@
               </template>
             </div>
           </el-popover>
+          <span
+            v-else-if="role === 'assistant' && tokenUsage?.isCopilot"
+            class="action-tokens"
+          >{{ $t('chat.usageDetail.unavailable') }}</span>
           <!-- Multimodal sidecar routing badge (assistant only, when sidecar fired) -->
           <span
             v-if="role === 'assistant' && routingBadge"
@@ -612,8 +620,10 @@ import { useSystemSettingsStore } from '@/stores/useSystemSettingsStore'
 import { storeToRefs } from 'pinia'
 import PlanStepsPanel from './PlanStepsPanel.vue'
 import UserMessageContent from './UserMessageContent.vue'
+import ContextUsagePanel from './ContextUsagePanel.vue'
 import type { BrowserAction } from './BrowserTimeline.vue'
-import type { Message, MessageSegment, ChatAttachment, ToolCallMeta, PlanMeta, DelegationNode } from '@/types'
+import type { Message, MessageSegment, ChatAttachment, ToolCallMeta, PlanMeta, DelegationNode, MessageMetadata } from '@/types'
+import type { ContextUsageEvent } from '@/composables/chat/useChat'
 import type { ChatErrorInfo } from '@/types/chatError'
 
 const { t, locale } = useI18n()
@@ -1038,11 +1048,37 @@ const formattedTime = computed(() => {
 // Reply model attribution: shows which model produced the assistant message.
 // Empty for streaming (server only emits runtimeModel after persistence) and
 // historical messages prior to MessageVO carrying the field.
-const replyModel = computed(() => props.message.runtimeModel || '')
+const messageMetadata = computed(() => props.message.metadata as MessageMetadata | undefined)
+const runtimeProvider = computed(() =>
+  props.message.runtimeProvider || messageMetadata.value?.runtimeProviderId || '',
+)
+const replyModel = computed(() =>
+  props.message.runtimeModel || messageMetadata.value?.runtimeModelName || '',
+)
 const replyModelTitle = computed(() => {
-  const provider = props.message.runtimeProvider
   const base = t('chat.replyModel', { model: replyModel.value })
-  return provider ? `${base} (${provider})` : base
+  return runtimeProvider.value ? `${base} (${runtimeProvider.value})` : base
+})
+const messageContextUsage = computed<ContextUsageEvent | null>(() => {
+  const metadata = messageMetadata.value
+  if (runtimeProvider.value.toLowerCase() !== 'copilot'
+    || metadata?.usageAvailability?.contextTokens !== true
+    || metadata.usageAvailability.contextWindow !== true
+    || typeof metadata.contextTokens !== 'number'
+    || typeof metadata.contextWindow !== 'number'
+    || metadata.contextWindow <= 0) return null
+  return {
+    usedTokens: metadata.contextTokens,
+    windowTokens: metadata.contextWindow,
+    systemTokens: 0,
+    toolsTokens: 0,
+    historyTokens: 0,
+    currentTokens: 0,
+    ratio: metadata.contextTokens / metadata.contextWindow,
+    willCompact: false,
+    runtimeProviderId: 'copilot',
+    usageAvailability: metadata.usageAvailability,
+  }
 })
 
 // Multimodal routing badge: rendered only when a sidecar actually fired this
@@ -1256,25 +1292,42 @@ const useSegmentedView = computed(() =>
 const tokenUsage = computed(() => {
   const m = props.message
   if (m.role !== 'assistant') return null
+  const metadata = messageMetadata.value
+  const provider = runtimeProvider.value.toLowerCase()
+  const copilot = provider === 'copilot'
+  const availability = metadata?.usageAvailability
+  const availabilityAware = !!availability || copilot
+  const promptValue = metadata?.promptTokens ?? m.promptTokens
+  const completionValue = metadata?.completionTokens ?? m.completionTokens
+  const promptAvailable = availabilityAware
+    ? availability?.promptTokens === true && typeof promptValue === 'number'
+    : promptValue !== undefined
+  const completionAvailable = availabilityAware
+    ? availability?.completionTokens === true && typeof completionValue === 'number'
+    : completionValue !== undefined
+  const measuredPrompt = promptAvailable ? promptValue ?? null : null
+  const measuredCompletion = completionAvailable ? completionValue ?? null : null
+  if (!promptAvailable && !completionAvailable && !copilot) return null
+
   // Base usage comes from the message, which the backend already rolls
   // delegated sub-agent tokens into (so live and reloaded values match and there
   // is no double counting against the segment sum below).
-  const prompt = m.promptTokens || 0
-  const output = m.completionTokens || 0
-  if (prompt + output <= 0) return null
-  const cacheRead = m.cacheReadTokens || 0
-  const cacheWrite = m.cacheWriteTokens || 0
-  const reasoning = m.reasoningTokens || 0
+  const prompt = measuredPrompt || 0
+  const output = measuredCompletion || 0
+  if (!copilot && prompt + output <= 0) return null
+  const cacheRead = copilot ? 0 : m.cacheReadTokens || 0
+  const cacheWrite = copilot ? 0 : m.cacheWriteTokens || 0
+  const reasoning = copilot ? null : m.reasoningTokens || 0
   // Provider accounting differs: the native Anthropic API reports input_tokens
   // EXCLUDING the cache read/write segments (additive), while OpenAI-compatible
   // and DashScope responses report prompt_tokens INCLUDING cached hits.
-  const additive = (m.runtimeProvider || '').toLowerCase().includes('anthropic')
-  const input = additive ? prompt + cacheRead + cacheWrite : prompt
-  const cacheMiss = Math.max(0, input - cacheRead - cacheWrite)
-  const reply = Math.max(0, output - reasoning)
-  const hitRate = input > 0 ? cacheRead / input : 0
+  const additive = provider.includes('anthropic')
+  const input = measuredPrompt === null ? null : additive ? prompt + cacheRead + cacheWrite : prompt
+  const cacheMiss = input === null ? 0 : Math.max(0, input - cacheRead - cacheWrite)
+  const reply = measuredCompletion === null || reasoning === null ? null : Math.max(0, output - reasoning)
+  const hitRate = input && input > 0 ? cacheRead / input : 0
   const hasCacheData = cacheRead > 0 || cacheWrite > 0
-  const total = input + output
+  const total = (input || 0) + (measuredCompletion || 0)
   // Informational breakdown for the tooltip: how much of that total came from
   // delegated sub-agents. Derived from the delegation segments, so it is present
   // live and degrades to 0 after reload (the segments are not persisted).
@@ -1292,15 +1345,21 @@ const tokenUsage = computed(() => {
     addNodes(s.childTimeline?.children)
   }
   return {
-    input, output, total, delegated: Math.min(delegated, total),
+    input, output: measuredCompletion, total, delegated: Math.min(delegated, total),
     cacheRead, cacheWrite, cacheMiss, reasoning, reply, hitRate, hasCacheData,
+    hasCounters: promptAvailable || completionAvailable,
+    isCopilot: copilot,
   }
 })
+
+function formatUsageValue(value: number | null): string {
+  return value === null ? t('chat.usageDetail.unavailable') : value.toLocaleString()
+}
 
 /** Width of a cache-bar segment as a percentage of total input tokens. */
 function usageBarPct(part: number): string {
   const u = tokenUsage.value
-  if (!u || u.input <= 0) return '0%'
+  if (!u || u.input === null || u.input <= 0) return '0%'
   return (part / u.input * 100).toFixed(2) + '%'
 }
 

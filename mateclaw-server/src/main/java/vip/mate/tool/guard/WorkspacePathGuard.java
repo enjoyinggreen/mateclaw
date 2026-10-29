@@ -29,6 +29,12 @@ public final class WorkspacePathGuard {
 
     private WorkspacePathGuard() {}
 
+    public static final class PathValidationException extends IllegalArgumentException {
+        public PathValidationException(String message) {
+            super(message);
+        }
+    }
+
     /**
      * Shared skill repository root, trusted in addition to the per-conversation
      * workspace boundary. System-level skills live under this root (one
@@ -223,7 +229,7 @@ public final class WorkspacePathGuard {
 
         // 先用 normalize 检查，再尝试 toRealPath 防符号链接逃逸
         if (!normalized.startsWith(root) && !isExempt(normalized)) {
-            throw new IllegalArgumentException(
+            throw new PathValidationException(
                     "Path is outside workspace boundary: " + normalized + ", allowed root: " + root);
         }
 
@@ -233,7 +239,7 @@ public final class WorkspacePathGuard {
                 Path realPath = normalized.toRealPath();
                 Path realRoot = root.toFile().exists() ? root.toRealPath() : root;
                 if (!realPath.startsWith(realRoot) && !isExemptReal(realPath)) {
-                    throw new IllegalArgumentException(
+                    throw new PathValidationException(
                             "Path escapes workspace via symlink: " + realPath + ", allowed root: " + realRoot);
                 }
                 return realPath;

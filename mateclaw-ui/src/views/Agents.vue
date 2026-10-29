@@ -114,10 +114,14 @@
                 <p class="agent-card__tagline">
                   {{ agentTagline(agent) || t('agents.messages.noTagline') }}
                 </p>
-                <span class="agent-runtime-badge" :class="{ 'agent-runtime-badge--dsh': agent.runtimeType === 'dsh' }">
-                  <svg v-if="agent.runtimeType === 'dsh'" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6 4 4 6-8"/><path d="M4 20h16"/></svg>
+                <span class="agent-runtime-badge" :class="{
+                  'agent-runtime-badge--dsh': normalizeRuntimeType(agent.runtimeType) === 'dsh',
+                  'agent-runtime-badge--copilot': normalizeRuntimeType(agent.runtimeType) === 'copilot',
+                }">
+                  <svg v-if="normalizeRuntimeType(agent.runtimeType) === 'dsh'" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6 4 4 6-8"/><path d="M4 20h16"/></svg>
+                  <svg v-else-if="normalizeRuntimeType(agent.runtimeType) === 'copilot'" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 5.4L19 10.2l-5.2 1.8L12 17l-1.8-5-5.2-1.8 5.2-1.8L12 3z"/></svg>
                   <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
-                  {{ agent.runtimeType === 'dsh' ? t('agents.runtime.dsh') : t('agents.runtime.native') }}
+                  {{ t(`agents.runtime.${normalizeRuntimeType(agent.runtimeType)}`) }}
                 </span>
                 <div v-if="agentTags(agent).length" class="agent-card__tags">
                   <span v-for="tag in agentTags(agent)" :key="tag" class="agent-card__tag"
@@ -302,14 +306,23 @@
               <select v-model="form.runtimeType" class="form-input">
                 <option value="native">{{ t('agents.runtime.native') }}</option>
                 <option value="dsh">{{ t('agents.runtime.dsh') }}</option>
+                <option value="copilot">{{ t('agents.runtime.copilot') }}</option>
               </select>
-              <p class="form-hint">{{ form.runtimeType === 'dsh' ? t('agents.fields.runtimeDshHint') : t('agents.fields.runtimeNativeHint') }}</p>
+              <p class="form-hint">{{ form.runtimeType === 'dsh'
+                ? t('agents.fields.runtimeDshHint')
+                : form.runtimeType === 'copilot'
+                  ? t('agents.fields.runtimeCopilotHint')
+                  : t('agents.fields.runtimeNativeHint') }}</p>
             </div>
-            <div v-if="form.runtimeType === 'dsh'" class="form-group full-width">
-              <label class="form-label">{{ t('agents.fields.runtimeConfig') }}</label>
+            <div v-if="form.runtimeType === 'dsh' || form.runtimeType === 'copilot'" class="form-group full-width">
+              <label class="form-label">{{ form.runtimeType === 'copilot'
+                ? t('agents.fields.runtimeConfigCopilot')
+                : t('agents.fields.runtimeConfig') }}</label>
               <textarea v-model="form.runtimeConfig" class="form-textarea runtime-config-editor" rows="4" spellcheck="false" placeholder="{}"></textarea>
-              <p class="form-hint">{{ t('agents.fields.runtimeConfigHint') }}</p>
-              <p v-if="dshDiagnostics" class="form-hint runtime-diagnostics" :class="{ 'runtime-diagnostics--ready': dshDiagnostics.executableAvailable && dshDiagnostics.cordisConfigAvailable }">
+              <p class="form-hint">{{ form.runtimeType === 'copilot'
+                ? t('agents.fields.runtimeConfigCopilotHint')
+                : t('agents.fields.runtimeConfigHint') }}</p>
+              <p v-if="form.runtimeType === 'dsh' && dshDiagnostics" class="form-hint runtime-diagnostics" :class="{ 'runtime-diagnostics--ready': dshDiagnostics.executableAvailable && dshDiagnostics.cordisConfigAvailable }">
                 {{ dshDiagnostics.executableAvailable && dshDiagnostics.cordisConfigAvailable
                   ? t('agents.fields.runtimeReady')
                   : t('agents.fields.runtimeUnavailable') }}
@@ -321,7 +334,7 @@
             </div>
             <!-- RFC-03 Lane G1: per-Agent model override. Empty value falls
                  back to the global default in ModelConfigService.resolveModel. -->
-            <div class="form-group">
+            <div v-if="form.runtimeType !== 'copilot'" class="form-group">
               <label class="form-label">{{ t('agents.fields.modelName') }}</label>
               <select v-model="form.modelName" class="form-input">
                 <option value="">{{ t('agents.fields.modelGlobalDefault') }}</option>
@@ -748,6 +761,7 @@ import { mcToast } from '@/composables/useMcToast'
 import { mcConfirm } from '@/components/common/useConfirm'
 import { agentApi, agentBindingApi, modelApi, skillApi, toolApi, templateApi, liveApi, wikiApi } from '@/api/index'
 import type { Agent } from '@/types/index'
+import { normalizeRuntimeConfig, normalizeRuntimeType } from '@/utils/runtimeSelection'
 import { parseAgentsLiveRoute, type AgentsView } from '@/composables/agentsLiveRouteState'
 import {
   emptyProfile,
@@ -996,6 +1010,7 @@ const filterTabs = [
   { key: 'agents.tabs.react', value: 'react' },
   { key: 'agents.tabs.planExecute', value: 'plan_execute' },
   { key: 'agents.tabs.dsh', value: 'dsh' },
+  { key: 'agents.tabs.copilot', value: 'copilot' },
   { key: 'agents.tabs.enabled', value: 'enabled' },
   { key: 'agents.tabs.disabled', value: 'disabled' },
 ]
@@ -1173,7 +1188,8 @@ const filteredAgents = computed(() => {
   }
   if (activeFilter.value === 'react') list = list.filter(a => a.agentType === 'react')
   else if (activeFilter.value === 'plan_execute') list = list.filter(a => a.agentType === 'plan_execute')
-  else if (activeFilter.value === 'dsh') list = list.filter(a => a.runtimeType === 'dsh')
+  else if (activeFilter.value === 'dsh') list = list.filter(a => normalizeRuntimeType(a.runtimeType) === 'dsh')
+  else if (activeFilter.value === 'copilot') list = list.filter(a => normalizeRuntimeType(a.runtimeType) === 'copilot')
   else if (activeFilter.value === 'enabled') list = list.filter(a => a.enabled)
   else if (activeFilter.value === 'disabled') list = list.filter(a => !a.enabled)
   // Tag filter: intersection — an agent must carry every selected tag.
@@ -1419,7 +1435,7 @@ async function openEditModal(agent: Agent) {
     name: agent.name,
     description: agent.description || '',
     agentType: agent.agentType,
-    runtimeType: agent.runtimeType || 'native',
+    runtimeType: normalizeRuntimeType(agent.runtimeType),
     runtimeConfig: agent.runtimeConfig || null,
     systemPrompt: agent.systemPrompt || '',
     modelName: agent.modelName || '',
@@ -1519,17 +1535,15 @@ function closeModal() {
 
 async function saveAgent() {
   try {
-    if (form.value.runtimeType === 'dsh') {
-      try {
-        const parsed = JSON.parse(form.value.runtimeConfig || '{}')
-        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('object')
-        form.value.runtimeConfig = JSON.stringify(parsed, null, 2)
-      } catch {
-        mcToast.error(t('agents.messages.runtimeConfigInvalid'))
-        return
-      }
-    } else {
-      form.value.runtimeConfig = null
+    const runtimeType = normalizeRuntimeType(form.value.runtimeType)
+    form.value.runtimeType = runtimeType
+    try {
+      form.value.runtimeConfig = normalizeRuntimeConfig(runtimeType, form.value.runtimeConfig)
+    } catch {
+      mcToast.error(t(runtimeType === 'copilot'
+        ? 'agents.messages.copilotRuntimeConfigInvalid'
+        : 'agents.messages.runtimeConfigInvalid'))
+      return
     }
     // Flatten the structured profile back to a single systemPrompt before
     // sending to the backend — the schema is unchanged, only the editor
@@ -1846,6 +1860,10 @@ html.dark .seg-count.warn {
 .agent-runtime-badge--dsh {
   background: var(--mc-primary-bg);
   color: var(--mc-primary-hover);
+}
+.agent-runtime-badge--copilot {
+  background: var(--mc-accent-soft);
+  color: var(--mc-accent);
 }
 
 .runtime-config-editor {

@@ -694,6 +694,261 @@ public class ConversationService {
         return message;
     }
 
+    @Transactional
+    public MessageEntity beginCopilotTurn(
+            String conversationId, String executionId, String runtimeProvider, String runtimeModel) {
+        requireCopilotExecution(conversationId, null, executionId);
+        Map<String, Object> metadata = new java.util.LinkedHashMap<>();
+        metadata.put("runtimeExecutionId", executionId);
+        if (runtimeProvider != null && !runtimeProvider.isBlank()) {
+            metadata.put("runtimeProviderId", runtimeProvider);
+        }
+        if (runtimeModel != null && !runtimeModel.isBlank()) {
+            metadata.put("runtimeModelName", runtimeModel);
+        }
+        MessageEntity marker = new MessageEntity();
+        marker.setConversationId(conversationId);
+        marker.setRole("assistant");
+        marker.setContent("");
+        marker.setStatus("generating");
+        marker.setTokenUsage(0);
+        marker.setPromptTokens(0);
+        marker.setCompletionTokens(0);
+        marker.setCacheReadTokens(0);
+        marker.setCacheWriteTokens(0);
+        marker.setReasoningTokens(0);
+        marker.setRuntimeModel(runtimeModel);
+        marker.setRuntimeProvider(runtimeProvider);
+        marker.setMetadata(writeCopilotMetadata(metadata));
+        messageMapper.insert(marker);
+
+        ConversationEntity conversation = conversationMapper.selectOne(
+                new LambdaQueryWrapper<ConversationEntity>()
+                        .eq(ConversationEntity::getConversationId, conversationId));
+        if (conversation != null) {
+            conversation.setMessageCount(conversation.getMessageCount() == null
+                    ? 1 : conversation.getMessageCount() + 1);
+            conversation.setLastActiveTime(LocalDateTime.now());
+            conversationMapper.updateById(conversation);
+        }
+        return marker;
+    }
+
+    @Transactional
+    public int reconcileOrphanedCopilotTurns() {
+        List<MessageEntity> orphaned = messageMapper.selectList(
+                new LambdaQueryWrapper<MessageEntity>()
+                        .eq(MessageEntity::getRole, "assistant")
+                        .eq(MessageEntity::getRuntimeProvider, "copilot")
+                        .eq(MessageEntity::getStatus, "generating")
+                        .eq(MessageEntity::getDeleted, 0));
+        int reconciled = 0;
+        for (MessageEntity marker : orphaned) {
+            Map<String, Object> metadata = new java.util.LinkedHashMap<>();
+            if (marker.getMetadata() != null && !marker.getMetadata().isBlank()) {
+                try {
+                    Map<String, Object> parsed = objectMapper.readValue(
+                            MessageMetadataJson.normalize(marker.getMetadata()),
+                            new TypeReference<Map<String, Object>>() {});
+                    if (parsed != null) {
+                        metadata.putAll(parsed);
+                    } else {
+                        log.warn("Copilot interrupted marker {} had null metadata; replacing metadata",
+                                marker.getId());
+                    }
+                } catch (IOException error) {
+                    log.warn("Copilot interrupted marker {} had invalid metadata; replacing metadata",
+                            marker.getId());
+                }
+            }
+            metadata.put("runtimeOutcome", "failed");
+            metadata.put("runtimeErrorCode", "copilot.interrupted");
+            String recoveredMetadata = writeCopilotMetadata(metadata);
+
+            LambdaUpdateWrapper<MessageEntity> update = new LambdaUpdateWrapper<MessageEntity>()
+                    .eq(MessageEntity::getId, marker.getId())
+                    .eq(MessageEntity::getConversationId, marker.getConversationId())
+                    .eq(MessageEntity::getRole, "assistant")
+                    .eq(MessageEntity::getRuntimeProvider, "copilot")
+                    .eq(MessageEntity::getStatus, "generating")
+                    .eq(MessageEntity::getDeleted, 0)
+                    .set(MessageEntity::getStatus, "failed")
+                    .set(MessageEntity::getMetadata, recoveredMetadata);
+            reconciled += messageMapper.update(null, update);
+        }
+        if (reconciled > 0) {
+            log.info("Reconciled {} interrupted Copilot turn(s)", reconciled);
+        }
+        return reconciled;
+    }
+
+    @Transactional
+    public boolean checkpointCopilotTurn(
+            String conversationId,
+            Long assistantMessageId,
+            String executionId,
+            String content,
+            String metadata,
+            String runtimeModel,
+            String runtimeProvider) {
+        requireCopilotExecution(conversationId, assistantMessageId, executionId);
+        MessageEntity existing = messageMapper.selectById(assistantMessageId);
+        if (!matchesCopilotExecution(existing, conversationId, executionId)
+                || !"generating".equals(existing.getStatus())) {
+            return false;
+        }
+        String normalizedMetadata = normalizeCopilotMetadata(metadata, executionId, null);
+        LambdaUpdateWrapper<MessageEntity> update = new LambdaUpdateWrapper<MessageEntity>()
+                .eq(MessageEntity::getId, assistantMessageId)
+                .eq(MessageEntity::getConversationId, conversationId)
+                .eq(MessageEntity::getRole, "assistant")
+                .eq(MessageEntity::getStatus, "generating")
+                .set(MessageEntity::getMetadata, normalizedMetadata);
+        if (content != null && !content.isBlank()) {
+            update.set(MessageEntity::getContent, content);
+        }
+        if (runtimeModel != null && !runtimeModel.isBlank()) {
+            update.set(MessageEntity::getRuntimeModel, runtimeModel);
+        }
+        if (runtimeProvider != null && !runtimeProvider.isBlank()) {
+            update.set(MessageEntity::getRuntimeProvider, runtimeProvider);
+        }
+        return messageMapper.update(null, update) == 1;
+    }
+
+    @Transactional
+    public MessageEntity finalizeCopilotTurn(
+            String conversationId,
+            Long assistantMessageId,
+            String executionId,
+            String content,
+            String status,
+            String runtimeOutcome,
+            String metadata,
+            String runtimeModel,
+            String runtimeProvider) {
+        requireCopilotExecution(conversationId, assistantMessageId, executionId);
+        validateCopilotOutcome(status, runtimeOutcome);
+        MessageEntity existing = messageMapper.selectById(assistantMessageId);
+        if (!matchesCopilotExecution(existing, conversationId, executionId)) return null;
+        if (isTerminalCopilotStatus(existing.getStatus())) return existing;
+
+        String normalizedMetadata = normalizeCopilotMetadata(metadata, executionId, runtimeOutcome);
+
+        LambdaUpdateWrapper<MessageEntity> update = new LambdaUpdateWrapper<MessageEntity>()
+                .eq(MessageEntity::getId, assistantMessageId)
+                .eq(MessageEntity::getConversationId, conversationId)
+                .eq(MessageEntity::getRole, "assistant")
+                .eq(MessageEntity::getStatus, "generating")
+                .set(MessageEntity::getStatus, status)
+                .set(MessageEntity::getMetadata, normalizedMetadata);
+        if (content != null && !content.isBlank()) {
+            update.set(MessageEntity::getContent, content);
+        }
+        if (runtimeModel != null && !runtimeModel.isBlank()) {
+            update.set(MessageEntity::getRuntimeModel, runtimeModel);
+        }
+        if (runtimeProvider != null && !runtimeProvider.isBlank()) {
+            update.set(MessageEntity::getRuntimeProvider, runtimeProvider);
+        }
+
+        if (messageMapper.update(null, update) == 1) {
+            MessageEntity finalized = messageMapper.selectById(assistantMessageId);
+            if (finalized == null) {
+                throw new IllegalStateException("Copilot assistant marker disappeared after finalization");
+            }
+            updateCopilotConversationPreview(conversationId, finalized.getContent());
+            return finalized;
+        }
+
+        MessageEntity reloaded = messageMapper.selectById(assistantMessageId);
+        if (matchesCopilotExecution(reloaded, conversationId, executionId)
+                && isTerminalCopilotStatus(reloaded.getStatus())) {
+            return reloaded;
+        }
+        return null;
+    }
+
+    private void updateCopilotConversationPreview(String conversationId, String content) {
+        if (content == null || content.isBlank()) return;
+        ConversationEntity conversation = conversationMapper.selectOne(
+                new LambdaQueryWrapper<ConversationEntity>()
+                        .eq(ConversationEntity::getConversationId, conversationId));
+        if (conversation == null) return;
+        String summary = summarizeMessage(content, null);
+        conversation.setLastMessage(summary.length() > 50 ? summary.substring(0, 50) + "..." : summary);
+        conversation.setLastActiveTime(LocalDateTime.now());
+        conversationMapper.updateById(conversation);
+    }
+
+    private static void requireCopilotExecution(
+            String conversationId, Long assistantMessageId, String executionId) {
+        if (conversationId == null || conversationId.isBlank()
+                || executionId == null || executionId.isBlank()
+                || executionId.indexOf('%') >= 0 || executionId.indexOf('_') >= 0
+                || assistantMessageId != null && assistantMessageId <= 0) {
+            throw new IllegalArgumentException("Copilot conversation, marker, and execution identity are required");
+        }
+    }
+
+    private static void validateCopilotOutcome(String status, String runtimeOutcome) {
+        boolean valid = ("completed".equals(status) && "completed".equals(runtimeOutcome))
+                || ("failed".equals(status) && "failed".equals(runtimeOutcome))
+                || ("stopped".equals(status) && "cancelled".equals(runtimeOutcome));
+        if (!valid) {
+            throw new IllegalArgumentException("Copilot terminal status and runtime outcome do not match");
+        }
+    }
+
+    private String normalizeCopilotMetadata(String metadata, String executionId, String runtimeOutcome) {
+        Map<String, Object> values = new java.util.LinkedHashMap<>();
+        if (metadata != null && !metadata.isBlank()) {
+            try {
+                Map<String, Object> parsed = objectMapper.readValue(
+                        metadata, new TypeReference<Map<String, Object>>() {});
+                if (parsed == null) {
+                    throw new IllegalArgumentException("Copilot metadata must be a JSON object");
+                }
+                values.putAll(parsed);
+            } catch (IOException error) {
+                throw new IllegalArgumentException("Copilot metadata must be valid JSON", error);
+            }
+        }
+        values.put("runtimeExecutionId", executionId);
+        if (runtimeOutcome != null) values.put("runtimeOutcome", runtimeOutcome);
+        return writeCopilotMetadata(values);
+    }
+
+    private String writeCopilotMetadata(Map<String, Object> metadata) {
+        try {
+            return objectMapper.writeValueAsString(metadata);
+        } catch (IOException error) {
+            throw new IllegalStateException("Could not serialize Copilot turn metadata", error);
+        }
+    }
+
+    private boolean matchesCopilotExecution(
+            MessageEntity message, String conversationId, String executionId) {
+        if (message == null || !conversationId.equals(message.getConversationId())
+                || !"assistant".equals(message.getRole())) {
+            return false;
+        }
+        try {
+            String normalizedMetadata = MessageMetadataJson.normalize(message.getMetadata());
+            if (normalizedMetadata == null || normalizedMetadata.isBlank()) return false;
+            Map<String, Object> metadata = objectMapper.readValue(
+                    normalizedMetadata, new TypeReference<Map<String, Object>>() {});
+            return metadata != null && executionId.equals(metadata.get("runtimeExecutionId"));
+        } catch (IOException error) {
+            log.warn("Ignoring malformed metadata for Copilot assistant marker {}", message.getId(), error);
+            return false;
+        }
+    }
+
+    private static boolean isTerminalCopilotStatus(String status) {
+        return "completed".equals(status) || "failed".equals(status) || "stopped".equals(status);
+    }
+
     /**
      * Update a message's metadata JSON (toolCalls, plan, currentPhase, …).
      *

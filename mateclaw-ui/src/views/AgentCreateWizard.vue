@@ -104,12 +104,17 @@
                 <select v-model="draft.runtimeType" class="wiz-control">
                   <option value="native">{{ t('agents.runtime.native') }}</option>
                   <option value="dsh">{{ t('agents.runtime.dsh') }}</option>
+                  <option value="copilot">{{ t('agents.runtime.copilot') }}</option>
                 </select>
               </div>
-              <div v-if="draft.runtimeType === 'dsh'" class="wiz-field wiz-full">
-                <label>{{ t('agents.fields.runtimeConfig') }}</label>
+              <div v-if="draft.runtimeType === 'dsh' || draft.runtimeType === 'copilot'" class="wiz-field wiz-full">
+                <label>{{ draft.runtimeType === 'copilot'
+                  ? t('agents.fields.runtimeConfigCopilot')
+                  : t('agents.fields.runtimeConfig') }}</label>
                 <textarea v-model="draft.runtimeConfig" class="wiz-control runtime-config-editor" rows="4" spellcheck="false" placeholder="{}"></textarea>
-                <small class="wiz-field-hint">{{ t('agents.fields.runtimeConfigHint') }}</small>
+                <small class="wiz-field-hint">{{ draft.runtimeType === 'copilot'
+                  ? t('agents.fields.runtimeConfigCopilotHint')
+                  : t('agents.fields.runtimeConfigHint') }}</small>
               </div>
               <div class="wiz-field wiz-full">
                 <label>{{ t('agents.wizard.fields.description') }}</label>
@@ -225,6 +230,8 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { agentApi, agentBindingApi, toolApi, skillApi, wikiApi } from '@/api'
 import { mcToast } from '@/composables/useMcToast'
+import type { AgentRuntimeType } from '@/types'
+import { normalizeRuntimeConfig, normalizeRuntimeType } from '@/utils/runtimeSelection'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import SkillIconPicker from '@/components/common/SkillIconPicker.vue'
 import WizardCapabilityPicker from '@/components/agent/WizardCapabilityPicker.vue'
@@ -246,7 +253,7 @@ interface Draft {
   icon: string
   description: string
   agentType: string
-  runtimeType: 'native' | 'dsh'
+  runtimeType: AgentRuntimeType
   runtimeConfig: string | null
   systemPrompt: string
   role?: string
@@ -322,7 +329,7 @@ async function generate() {
       icon: d.icon || '🤖',
       description: d.description || '',
       agentType: d.agentType || 'react',
-      runtimeType: d.runtimeType === 'dsh' ? 'dsh' : 'native',
+      runtimeType: normalizeRuntimeType(d.runtimeType),
       runtimeConfig: d.runtimeConfig || null,
       systemPrompt: d.systemPrompt || '',
       role: d.role,
@@ -349,6 +356,16 @@ async function confirmCreate() {
   if (!draft.value || !draft.value.name.trim()) return
   creating.value = true
   try {
+    const runtimeType = normalizeRuntimeType(draft.value.runtimeType)
+    let runtimeConfig: string | null
+    try {
+      runtimeConfig = normalizeRuntimeConfig(runtimeType, draft.value.runtimeConfig)
+    } catch {
+      mcToast.error(t(runtimeType === 'copilot'
+        ? 'agents.messages.copilotRuntimeConfigInvalid'
+        : 'agents.messages.runtimeConfigInvalid'))
+      return
+    }
     const tags = tagsText.value
       .split(/[,，]/)
       .map((s) => s.trim())
@@ -359,8 +376,8 @@ async function confirmCreate() {
       icon: draft.value.icon,
       description: draft.value.description,
       agentType: draft.value.agentType,
-      runtimeType: draft.value.runtimeType,
-      runtimeConfig: draft.value.runtimeType === 'dsh' ? (draft.value.runtimeConfig || '{}') : null,
+      runtimeType,
+      runtimeConfig,
       systemPrompt: draft.value.systemPrompt,
       tags,
       enabled: true,

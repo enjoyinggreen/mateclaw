@@ -79,6 +79,8 @@
         <maven-dependency-plugin.version>3.8.1</maven-dependency-plugin.version>
         <maven-surefire-plugin.version>3.5.5</maven-surefire-plugin.version>
         <flatten-maven-plugin.version>1.7.3</flatten-maven-plugin.version>
+        <!-- GitHub Copilot SDK -->
+        <copilot-sdk-java.version>1.0.14-preview.1</copilot-sdk-java.version>
     </properties>
 
     <dependencyManagement>
@@ -335,6 +337,13 @@
                 <groupId>io.pebbletemplates</groupId>
                 <artifactId>pebble</artifactId>
                 <version>${pebble.version}</version>
+            </dependency>
+
+            <!-- ==================== GitHub Copilot SDK ==================== -->
+            <dependency>
+                <groupId>com.github</groupId>
+                <artifactId>copilot-sdk-java</artifactId>
+                <version>${copilot-sdk-java.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

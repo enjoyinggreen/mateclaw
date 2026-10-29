@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import vip.mate.plugin.PluginManager;
@@ -24,9 +25,11 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -153,5 +156,22 @@ class SystemSettingServiceCatalogTest {
 
         assertNull(catalog.resolvedId());
         assertNull(catalog.resolvedSource());
+    }
+
+    @Test
+    void copilotGithubTokenIsEncryptedAtRestAndDecryptedOnRead() {
+        SettingCrypto crypto = new SettingCrypto("test-key");
+        service = new SystemSettingService(mapper, new SearchProviderRegistry(List.of()),
+                crypto, new WorkspaceSandboxProperties(), pluginManager);
+        service.saveString("copilot.github_token", "ghp-copilot-secret", "Copilot GitHub token");
+
+        ArgumentCaptor<SystemSettingEntity> inserted = ArgumentCaptor.forClass(SystemSettingEntity.class);
+        verify(mapper).insert(inserted.capture());
+        String stored = inserted.getValue().getSettingValue();
+        assertTrue(crypto.isEncrypted(stored));
+        assertNotEquals("ghp-copilot-secret", stored);
+
+        when(mapper.selectOne(any())).thenReturn(inserted.getValue());
+        assertEquals("ghp-copilot-secret", service.getString("copilot.github_token", null));
     }
 }

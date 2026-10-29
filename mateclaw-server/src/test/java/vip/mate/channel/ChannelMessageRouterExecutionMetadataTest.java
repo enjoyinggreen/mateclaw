@@ -9,6 +9,7 @@ import reactor.core.publisher.Flux;
 import vip.mate.agent.AgentService;
 import vip.mate.agent.AgentService.StreamDelta;
 import vip.mate.agent.context.ChatOrigin;
+import vip.mate.agent.model.AgentEntity;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.channel.model.ChannelEntity;
 import vip.mate.channel.notification.ApprovalNotificationService;
@@ -124,6 +125,52 @@ class ChannelMessageRouterExecutionMetadataTest {
         verify(f.streamTracker).broadcastObject(eq("telegram:alice"), eq("tool_call_completed"), any());
         verify(f.streamTracker).broadcastObject(eq("telegram:alice"), eq("content_delta"), any());
         verify(f.streamTracker, never()).broadcastObject(anyString(), eq("_usage_final"), any());
+    }
+
+    @Test
+    @DisplayName("authenticated Copilot channel failure finalizes its marker with runtime identity")
+    void copilotFailureFinalizesMarkerAndPublishesOutcome() throws Exception {
+        Fixture f = new Fixture();
+        AgentEntity copilot = new AgentEntity();
+        copilot.setId(100L);
+        copilot.setRuntimeType("copilot");
+        when(f.agentService.getAgent(100L)).thenReturn(copilot);
+        ChatOrigin trustedOrigin = ChatOrigin.web("telegram:alice", "alice", null,
+                null, null, 42L).withAgent(100L);
+        when(f.chatOriginFactory.from(any(), any(), any(), any())).thenReturn(trustedOrigin);
+        var marker = new vip.mate.workspace.conversation.model.MessageEntity();
+        marker.setId(7001L);
+        when(f.conversationService.beginCopilotTurn(
+                eq("telegram:alice"), anyString(), eq("copilot"), isNull())).thenReturn(marker);
+        when(f.agentService.chatStructuredStream(
+                eq(100L), anyString(), eq("telegram:alice"), eq("alice"), isNull(),
+                any(ChatOrigin.class), anyString(), eq(7001L))).thenAnswer(invocation ->
+                Flux.just(StreamDelta.event("error", Map.of(
+                        "runtimeExecutionId", invocation.getArgument(6, String.class),
+                        "assistantMessageId", 7001L,
+                        "runtimeProviderId", "copilot",
+                        "runtimeModelName", "gpt-4.1",
+                        "runtimeOutcome", "failed",
+                        "message", "provider failed"))));
+
+        f.process("hello");
+
+        ArgumentCaptor<String> metadata = ArgumentCaptor.forClass(String.class);
+        verify(f.conversationService).finalizeCopilotTurn(
+                eq("telegram:alice"), eq(7001L), anyString(), eq(""), eq("failed"), eq("failed"),
+                metadata.capture(), eq("gpt-4.1"), eq("copilot"));
+        verify(f.conversationService, never()).saveMessage(
+                eq("telegram:alice"), eq("assistant"), anyString(), any(), anyString(),
+                anyInt(), anyInt(), anyInt(), anyInt(), anyInt(), any(), any(), any());
+        JsonNode persisted = json.readTree(metadata.getValue());
+        assertEquals("failed", persisted.path("runtimeOutcome").asText());
+        assertEquals("provider failed", persisted.path("runtimeErrorMessage").asText());
+
+        ArgumentCaptor<Map<String, Object>> done = ArgumentCaptor.forClass(Map.class);
+        verify(f.streamTracker).broadcastObject(eq("telegram:alice"), eq("done"), done.capture());
+        assertEquals("failed", done.getValue().get("runtimeOutcome"));
+        assertEquals("copilot", done.getValue().get("runtimeProviderId"));
+        assertEquals("gpt-4.1", done.getValue().get("runtimeModelName"));
     }
 
     // ==================== helpers ====================

@@ -101,6 +101,25 @@ class DshConversationHistoryTest {
     }
 
     @Test
+    void boundedHistoryDoesNotSplitSurrogatePairsOrTruncateCurrentInput() {
+        row(1, "a", "assistant", "🙂".repeat(9000), "completed");
+        String currentInput = "current question 🙂";
+
+        String prompt = history.enrich("a", currentInput, currentInput, ChatOrigin.EMPTY);
+
+        assertTrue(prompt.contains("[truncated]"));
+        assertTrue(prompt.endsWith(currentInput));
+        for (int i = 0; i < prompt.length(); i++) {
+            char current = prompt.charAt(i);
+            if (Character.isHighSurrogate(current)) {
+                assertTrue(i + 1 < prompt.length() && Character.isLowSurrogate(prompt.charAt(i + 1)));
+            } else if (Character.isLowSurrogate(current)) {
+                assertTrue(i > 0 && Character.isHighSurrogate(prompt.charAt(i - 1)));
+            }
+        }
+    }
+
+    @Test
     void limitsHistoryRowsAndSurvivesNewBuilderInstance() {
         for (int i = 1; i <= 45; i++) row(i, "a", "user", "row-" + i + "-text", "completed");
         var restarted = new DshConversationHistory(session.getMapper(MessageMapper.class), new ObjectMapper());

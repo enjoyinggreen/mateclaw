@@ -1,0 +1,77 @@
+spec: 001-add-copilot-runtime
+status: in_progress
+current_phase: 7
+phases:
+  - phase: 1
+    name: Setup
+    status: complete
+    tasks:
+      T001: complete
+      T002: complete
+  - phase: 2
+    name: Foundational
+    status: complete
+    tasks:
+      T003: complete
+      T004: complete
+      T005: complete
+      T006: complete
+      T007: complete
+      T008: complete
+      T009: complete
+  - phase: 3
+    name: User Story 1
+    status: complete
+    tasks:
+      T010: complete
+      T011: complete
+      T012: complete
+      T013: complete
+      T014: complete
+      T015: complete
+      T016: complete
+      T017: complete
+      T018: complete
+      T019: complete
+  - phase: 4
+    name: User Story 2
+    status: complete
+    tasks:
+      T020: complete
+      T021: complete
+      T022: complete
+      T023: complete
+      T024: complete
+      T025: complete
+      T026: complete
+  - phase: 5
+    name: User Story 3
+    status: complete
+    tasks:
+      T027: complete
+      T028: complete
+      T029: complete
+      T030: complete
+      T031: complete
+      T032: complete
+      T033: complete
+      T034: complete
+      T035: complete
+  - phase: 6
+    name: User Story 4
+    status: complete
+    tasks:
+      T036: complete
+      T037: complete
+      T038: complete
+      T039: complete
+      T040: complete
+      T041: complete
+  - phase: 7
+    name: Polish and Cross-Cutting Concerns
+    status: in_progress
+    tasks:
+      T042: complete
+      T043: blocked
+      T044: complete
+      T045: blocked

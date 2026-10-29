@@ -17,8 +17,21 @@ public final class AgentRuntimeCoordinator {
 
     public AgentRuntimeConnection start(AgentEntity agent, String conversationId, String sessionId,
                                         String modelName, Path workspaceRoot, Path workingDirectory) {
+        return start(
+                agent,
+                conversationId,
+                sessionId,
+                modelName,
+                workspaceRoot,
+                workingDirectory,
+                null);
+    }
+
+    public AgentRuntimeConnection start(AgentEntity agent, String conversationId, String sessionId,
+                                        String modelName, Path workspaceRoot, Path workingDirectory,
+                                        RuntimeTurnContext turnContext) {
         RuntimeSession session = sessionFactory.create(agent, conversationId, sessionId,
-                modelName, workspaceRoot, workingDirectory);
+                modelName, workspaceRoot, workingDirectory, turnContext);
         return providerRegistry.resolve(agent.getRuntimeType()).start(session);
     }
 }
